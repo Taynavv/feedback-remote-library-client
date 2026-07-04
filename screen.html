@@ -1,0 +1,37 @@
+<div id="remote-library-client-root" class="mx-auto max-w-4xl px-6 pt-24 pb-16">
+  <button onclick="showScreen('home')" class="mb-6 flex items-center gap-1 text-sm text-gray-500 hover:text-white">
+    <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"/></svg>
+    Back
+  </button>
+
+  <section class="space-y-4">
+    <div class="flex items-center justify-between gap-3">
+      <div class="min-w-0">
+        <h2 class="text-3xl font-bold text-white">Remote Sources</h2>
+        <div id="remote-library-client-message" class="mt-2 min-h-5 text-sm text-gray-400"></div>
+      </div>
+      <div class="flex flex-shrink-0 items-center gap-2">
+        <button id="rlc-toggle-add" class="h-10 w-10 rounded-lg bg-accent text-lg font-semibold leading-none text-white transition hover:bg-accent-light" data-rlc-toggle-add aria-label="Add source" aria-expanded="false">+</button>
+      </div>
+    </div>
+
+    <form id="remote-library-client-add-form" class="hidden rounded-xl border border-gray-800/50 bg-dark-700/50 p-4" data-rlc-form>
+      <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(12rem,0.45fr)_auto] md:items-end">
+        <label class="space-y-1 text-sm text-gray-300">
+          <span class="block text-xs uppercase text-gray-500">Server URL</span>
+          <input id="rlc-base-url" type="text" required class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent/50" style="background:#0f172a;color:#f8fafc;" placeholder="studio.local" />
+        </label>
+        <label class="space-y-1 text-sm text-gray-300">
+          <span class="block text-xs uppercase text-gray-500">Label</span>
+          <input id="rlc-label" type="text" class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent/50" style="background:#0f172a;color:#f8fafc;" placeholder="Studio laptop" />
+        </label>
+        <div class="flex gap-2">
+          <button class="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-white transition hover:bg-accent-light" type="submit">Add</button>
+          <button class="rounded-lg bg-dark-600 px-3 py-2 text-sm text-gray-300 transition hover:bg-dark-500 hover:text-white" type="button" data-rlc-cancel-add>Cancel</button>
+        </div>
+      </div>
+    </form>
+
+    <div id="remote-library-client-sources" class="space-y-3"></div>
+  </section>
+</div>

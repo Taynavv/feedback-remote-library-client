@@ -1,0 +1,27 @@
+{
+  "id": "remote_library_client",
+  "name": "Remote Library Client",
+  "version": "0.1.3",
+  "feedback_target": "0.3.0-alpha.1",
+  "private": false,
+  "nav": { "label": "Remote Client", "screen": "remote-library-client" },
+  "screen": "screen.html",
+  "script": "screen.js",
+  "routes": "routes.py",
+  "category": "tools",
+  "description": "Browse and play a shared remote library.",
+  "icon": "assets/thumb.svg",
+  "standards": ["capability-pipelines.v1", "plugin-runtime-idempotent.v1"],
+  "capabilities": {
+    "library": {
+      "roles": ["provider"],
+      "operations": ["query-page", "query-artists", "query-stats", "tuning-names", "get-art", "sync-song"],
+      "description": "Registers configured Remote Library Server URLs as browsable library providers with remote metadata, artwork, and song sync.",
+      "mode": "active",
+      "compatibility": "none",
+      "ownership": "multi-provider",
+      "safety": "safe",
+      "version": 1
+    }
+  }
+}

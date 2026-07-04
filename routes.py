@@ -1,0 +1,298 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib import parse
+
+from fastapi import HTTPException
+
+from remote_library_client.provider import DirectLibraryProvider, _public_error_message, provider_id_for_source
+from remote_library_client.store import RemoteLibraryClientStore
+
+_store: RemoteLibraryClientStore | None = None
+_register_provider = None
+_unregister_provider = None
+_cache_dir: Path | None = None
+_get_dlc_dir = None
+_extract_meta = None
+_meta_db = None
+_config_dir: Path | None = None
+_providers: dict[str, DirectLibraryProvider] = {}
+DEFAULT_SOURCE_PORT = 8765
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _source_enabled(source: dict) -> bool:
+    return source.get("enabled") is not False
+
+
+def _format_base_url(scheme: str, netloc: str, *, add_default_port: bool = True) -> str:
+    parsed = parse.urlparse(f"{scheme}://{netloc}")
+    if not parsed.hostname:
+        raise ValueError("baseUrl must include a host")
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = parsed.port or (DEFAULT_SOURCE_PORT if add_default_port else None)
+    return f"{scheme}://{host}{f':{port}' if port else ''}".rstrip("/")
+
+
+def _candidate_base_urls(value: str) -> list[str]:
+    raw = str(value or "").strip().rstrip("/")
+    if not raw:
+        raise ValueError("Enter a server URL or hostname")
+    candidates = []
+    if "://" in raw:
+        parsed = parse.urlparse(raw)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("baseUrl must be an http(s) URL")
+        candidates.append(_format_base_url(parsed.scheme, parsed.netloc, add_default_port=False))
+        if parsed.port is None:
+            candidates.append(_format_base_url(parsed.scheme, parsed.netloc))
+    else:
+        raw = raw.lstrip("/")
+        if "/" in raw:
+            raise ValueError("baseUrl hostname cannot include a path")
+        for scheme in ("http", "https"):
+            candidates.append(_format_base_url(scheme, raw))
+    unique_candidates = []
+    for candidate in candidates:
+        if candidate not in unique_candidates:
+            unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def _probe_first_available(value: str) -> tuple[str, dict]:
+    errors = []
+    for base_url in _candidate_base_urls(value):
+        try:
+            return base_url, _probe_source(base_url)
+        except Exception as exc:
+            errors.append(f"{base_url}: {exc}")
+    detail = "Could not connect to a Remote Library Server."
+    if errors:
+        detail = f"{detail} Tried: {'; '.join(errors)}"
+    raise ValueError(detail)
+
+
+def _source_cache_dir() -> Path:
+    root = _cache_dir or (_store.root / "cache")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _provider_for_source(source: dict) -> DirectLibraryProvider:
+    local_root = _get_dlc_dir() if callable(_get_dlc_dir) else None
+    return DirectLibraryProvider(source, _source_cache_dir(), local_root, _import_library_file, _config_dir)
+
+
+def _import_library_file(package_path: Path, local_root: Path) -> dict | None:
+    if not callable(_extract_meta) or _meta_db is None or not hasattr(_meta_db, "put"):
+        return None
+    metadata = _extract_meta(package_path)
+    stat = package_path.stat()
+    try:
+        filename = package_path.relative_to(local_root).as_posix()
+    except ValueError:
+        filename = package_path.name
+    _meta_db.put(filename, stat.st_mtime, stat.st_size, metadata)
+    return {"libraryImportState": "indexed", "libraryFilename": filename}
+
+
+def _register_source_provider(source: dict, *, replace: bool = True) -> DirectLibraryProvider | None:
+    if not _source_enabled(source):
+        _unregister_source_provider(source.get("providerId") or "")
+        return None
+    provider = _provider_for_source(source)
+    if callable(_register_provider):
+        _register_provider(provider, replace=replace)
+    _providers[provider.id] = provider
+    return provider
+
+
+def _unregister_source_provider(provider_id: str) -> None:
+    _providers.pop(provider_id, None)
+    if callable(_unregister_provider):
+        try:
+            _unregister_provider(provider_id)
+        except ValueError:
+            pass
+
+
+def _probe_source(base_url: str) -> dict:
+    probe = DirectLibraryProvider({
+        "baseUrl": base_url,
+        "providerId": provider_id_for_source("probe", base_url),
+        "label": base_url,
+    }, _source_cache_dir())
+    return probe._json("/source", timeout=3)
+
+
+def _source_from_payload(base_url: str, payload: dict, label: str = "") -> dict:
+    source_id = str(payload.get("sourceId") or "")
+    provider_id = provider_id_for_source(source_id, base_url)
+    source_name = str(payload.get("sourceName") or label or base_url)
+    return {
+        "providerId": provider_id,
+        "baseUrl": base_url,
+        "sourceId": source_id,
+        "sourceName": source_name,
+        "label": label or source_name,
+        "protocol": (payload.get("server") or {}).get("protocol") or "slopsmith-direct-library.v1",
+        "songCount": int(payload.get("songCount") or 0),
+        "remoteCapabilities": list(payload.get("capabilities") or []),
+        "namToneSyncAvailable": bool((payload.get("namToneSync") or {}).get("enabled"))
+            or "nam-tone-sync.read" in set(payload.get("capabilities") or []),
+        "enabled": True,
+        "lastSuccessfulContactAt": _utc_now_iso(),
+    }
+
+
+def _source_fallback(base_url: str, label: str = "") -> dict:
+    source_name = str(label or base_url)
+    provider_id = provider_id_for_source("", base_url)
+    return {
+        "providerId": provider_id,
+        "baseUrl": base_url,
+        "sourceId": "",
+        "sourceName": source_name,
+        "label": source_name,
+        "protocol": "slopsmith-direct-library.v1",
+        "songCount": 0,
+        "enabled": True,
+        "lastSuccessfulContactAt": "",
+    }
+
+
+def _save_checked_source(source: dict, payload: dict) -> dict:
+    updated = {
+        **source,
+        **_source_from_payload(source.get("baseUrl") or "", payload, source.get("label") or ""),
+        "enabled": _source_enabled(source),
+        "syncNamToneAssets": bool(source.get("syncNamToneAssets")),
+    }
+    old_provider_id = source.get("providerId") or ""
+    new_provider_id = updated.get("providerId") or ""
+    if old_provider_id and old_provider_id != new_provider_id:
+        _store.remove_source(old_provider_id)
+        _unregister_source_provider(old_provider_id)
+    provider = _register_source_provider(updated, replace=True)
+    _store.upsert_source(updated)
+    return {**updated, "registered": bool(provider and provider.id in _providers), "online": bool(payload.get("ok", True)), "message": ""}
+
+
+def _provider_payload(provider: DirectLibraryProvider | None) -> dict | None:
+    if not provider:
+        return None
+    return {"id": provider.id, "label": provider.label}
+
+
+def setup(app, context):
+    global _store, _register_provider, _unregister_provider, _cache_dir, _get_dlc_dir, _extract_meta, _meta_db, _config_dir
+    _config_dir = Path(context["config_dir"])
+    _store = RemoteLibraryClientStore(_config_dir)
+    _register_provider = context.get("register_library_provider")
+    _unregister_provider = context.get("unregister_library_provider")
+    _get_dlc_dir = context.get("get_dlc_dir")
+    _extract_meta = context.get("extract_meta")
+    _meta_db = context.get("meta_db")
+    cache_factory = context.get("get_sloppak_cache_dir")
+    _cache_dir = Path(cache_factory()) / "remote_library_client" if callable(cache_factory) else _store.root / "cache"
+    for source in _store.list_sources():
+        try:
+            _register_source_provider(source, replace=True)
+        except Exception:
+            continue
+
+    @app.get("/api/plugins/remote_library_client/settings")
+    def get_settings():
+        return _store.load()
+
+    @app.get("/api/plugins/remote_library_client/status")
+    def status():
+        sources = []
+        for source in _store.list_sources():
+            provider_id = source.get("providerId") or ""
+            item = {
+                **source,
+                "enabled": _source_enabled(source),
+                "registered": provider_id in _providers,
+                "online": False,
+                "message": "",
+            }
+            if not _source_enabled(source):
+                item["message"] = "Disabled"
+                sources.append(item)
+                continue
+            try:
+                payload = _probe_source(source.get("baseUrl") or "")
+                item.update(_save_checked_source(source, payload))
+            except Exception as exc:
+                item["message"] = _public_error_message(exc)
+            sources.append(item)
+        return {"sources": sources, "providerSupport": callable(_register_provider)}
+
+    @app.post("/api/plugins/remote_library_client/sources")
+    def add_source(data: dict):
+        try:
+            base_url, payload = _probe_first_available(data.get("baseUrl") or data.get("url") or "")
+            label = str(data.get("label") or "").strip()
+            source = {**_source_from_payload(base_url, payload, label), "syncNamToneAssets": bool(data.get("syncNamToneAssets"))}
+            provider = _register_source_provider(source, replace=True)
+            _store.upsert_source(source)
+            return {"ok": True, "source": source, "provider": _provider_payload(provider)}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
+
+    @app.post("/api/plugins/remote_library_client/sources/{provider_id:path}/refresh")
+    def refresh_source(provider_id: str):
+        source = next((item for item in _store.list_sources() if item.get("providerId") == provider_id), None)
+        if not source:
+            raise HTTPException(status_code=404, detail="source not found")
+        if not _source_enabled(source):
+            return {"ok": True, "source": {**source, "enabled": False, "online": False, "message": "Disabled"}}
+        try:
+            payload = _probe_source(source.get("baseUrl") or "")
+            updated = _save_checked_source(source, payload)
+            provider_id = updated.get("providerId") or ""
+            provider = _providers.get(provider_id)
+            return {"ok": True, "source": updated, "provider": _provider_payload(provider)}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
+
+    @app.patch("/api/plugins/remote_library_client/sources/{provider_id:path}")
+    def update_source(provider_id: str, data: dict):
+        source = next((item for item in _store.list_sources() if item.get("providerId") == provider_id), None)
+        if not source:
+            raise HTTPException(status_code=404, detail="source not found")
+        allowed = {"enabled", "syncNamToneAssets"}
+        if not any(key in data for key in allowed):
+            raise HTTPException(status_code=400, detail="no supported source settings provided")
+        updated = dict(source)
+        if "enabled" in data:
+            updated["enabled"] = bool(data.get("enabled"))
+        if "syncNamToneAssets" in data:
+            updated["syncNamToneAssets"] = bool(data.get("syncNamToneAssets"))
+        if _source_enabled(updated):
+            try:
+                provider = _register_source_provider(updated, replace=True)
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
+            _store.upsert_source(updated)
+            return {"ok": True, "source": updated, "provider": _provider_payload(provider)}
+        _store.upsert_source(updated)
+        _unregister_source_provider(provider_id)
+        return {"ok": True, "source": updated, "provider": None}
+
+    @app.delete("/api/plugins/remote_library_client/sources/{provider_id:path}")
+    def remove_source(provider_id: str):
+        removed = _store.remove_source(provider_id)
+        _unregister_source_provider(provider_id)
+        if not removed:
+            raise HTTPException(status_code=404, detail="source not found")
+        return {"ok": True, "providerId": provider_id}
+
+    return app

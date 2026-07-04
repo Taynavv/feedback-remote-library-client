@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: pip install pytest fastapi httpx
+
+      - name: Run tests
+        run: pytest -v
+
+      - name: Check tag matches plugin.json version
+        run: |
+          python - <<'PY'
+          import json, os, sys
+          tag = os.environ["GITHUB_REF_NAME"].lstrip("v")
+          ver = json.load(open("plugin.json"))["version"]
+          if tag != ver:
+              sys.exit(f"tag v{tag} != plugin.json version {ver} — bump plugin.json before tagging")
+          PY
+
+      - name: Build plugin zip
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="feedback-remote-library-client"
+          mkdir -p "dist/$NAME"
+          cp -r plugin.json routes.py screen.html screen.js settings.html              remote_library_client README.md LICENSE "dist/$NAME/"
+          find "dist/$NAME" -name '__pycache__' -type d -prune -exec rm -rf {} +
+          cd dist
+          zip -r "${NAME}-${VERSION}.zip" "$NAME"
+          unzip -l "${NAME}-${VERSION}.zip"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME"             "dist/feedback-remote-library-client-${VERSION}.zip"             --title "feedback-remote-library-client ${GITHUB_REF_NAME}"             --generate-notes
