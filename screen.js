@@ -7,7 +7,8 @@
         refreshing: false,
         adding: false,
         statusTimer: null,
-        sourceBusy: {}
+        sourceBusy: {},
+        tokenEditor: null
     };
     window.__remoteLibraryClientPlugin = state;
     if (typeof state.addOpen !== 'boolean') state.addOpen = false;
@@ -16,6 +17,7 @@
     if (typeof state.adding !== 'boolean') state.adding = false;
     if (!('statusTimer' in state)) state.statusTimer = null;
     if (!state.sourceBusy || typeof state.sourceBusy !== 'object') state.sourceBusy = {};
+    if (!('tokenEditor' in state)) state.tokenEditor = null;
 
     const STALE_AFTER_MS = 5 * 60 * 1000;
 
@@ -50,8 +52,10 @@
     function clearAddForm() {
         const baseUrl = document.getElementById('rlc-base-url');
         const label = document.getElementById('rlc-label');
+        const token = document.getElementById('rlc-token');
         if (baseUrl) baseUrl.value = '';
         if (label) label.value = '';
+        if (token) token.value = '';
     }
 
     function normalizeBaseUrl(value) {
@@ -222,6 +226,14 @@
             const tokenLabel = busyMode === 'token'
                 ? 'Saving access token'
                 : source.hasToken ? 'Change or clear access token' : 'Set access token';
+            const editing = state.tokenEditor === source.providerId;
+            const tokenEditorHtml = editing ? `
+                <form data-rlc-token-form="${esc(source.providerId)}" class="mt-3 flex flex-wrap items-center gap-2 border-t border-gray-800/50 pt-3">
+                    <input id="rlc-token-input" type="password" autocomplete="off" placeholder="${source.hasToken ? 'Enter a new token (leave blank to clear)' : 'Access token'}" class="min-w-[12rem] flex-1 rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent/50" style="background:#0f172a;color:#f8fafc;" ${busy ? 'disabled' : ''} />
+                    <button type="submit" class="rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-white transition hover:bg-accent-light ${busy ? 'opacity-60 cursor-not-allowed' : ''}" ${busy ? 'disabled' : ''}>${busyMode === 'token' ? 'Saving...' : 'Save'}</button>
+                    ${source.hasToken ? `<button type="button" data-rlc-token-clear="${esc(source.providerId)}" class="rounded-lg bg-dark-600 px-3 py-2 text-sm text-gray-300 transition hover:bg-dark-500 hover:text-white ${busy ? 'opacity-60 cursor-not-allowed' : ''}" ${busy ? 'disabled' : ''}>Clear</button>` : ''}
+                    <button type="button" data-rlc-token-cancel class="rounded-lg bg-dark-600 px-3 py-2 text-sm text-gray-300 transition hover:bg-dark-500 hover:text-white" ${busy ? 'disabled' : ''}>Cancel</button>
+                </form>` : '';
             return `
             <div class="rounded-xl border border-gray-800/50 bg-dark-700/50 p-4 transition hover:border-accent/20">
                 <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -251,6 +263,7 @@
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-red-900/50 hover:text-red-300 ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-remove="${esc(source.providerId)}" aria-label="${esc(removeLabel)}" title="${esc(removeLabel)}" ${busy ? 'disabled' : ''}>${removeIcon()}</button>
                     </div>
                 </div>
+                ${tokenEditorHtml}
             </div>
             `;
         }).join('');
@@ -271,22 +284,24 @@
     async function addSource() {
         const baseUrl = normalizeBaseUrl(document.getElementById('rlc-base-url')?.value || '');
         const label = document.getElementById('rlc-label')?.value.trim() || '';
+        const token = document.getElementById('rlc-token')?.value.trim() || '';
         if (!baseUrl) throw new Error('Enter a server URL or hostname (for example: studio.local).');
         if (state.adding) return;
         setBusyState({ adding: true });
         setMessage('Adding source...', 'neutral');
         try {
+            const body = { baseUrl, label };
+            if (token) body.token = token;
             let result;
             try {
-                result = await api('/sources', { method: 'POST', body: JSON.stringify({ baseUrl, label }) });
+                result = await api('/sources', { method: 'POST', body: JSON.stringify(body) });
             } catch (error) {
                 if (error.status !== 401) throw error;
-                const token = window.prompt('This server requires an access token:', '');
-                if (!token || !token.trim()) {
-                    setMessage('Add cancelled — this server requires an access token.', 'error');
-                    return;
-                }
-                result = await api('/sources', { method: 'POST', body: JSON.stringify({ baseUrl, label, token: token.trim() }) });
+                setMessage(token
+                    ? 'The access token was rejected. Check it and click Add again.'
+                    : 'This server requires an access token. Enter it in the Access token field and click Add again.', 'error');
+                document.getElementById('rlc-token')?.focus();
+                return;
             }
             const added = result?.source || { baseUrl, label: label || baseUrl, online: false, songCount: 0 };
             const existingIndex = state.sources.findIndex(item => (item.providerId || '') === (added.providerId || ''));
@@ -359,7 +374,9 @@
                 body: JSON.stringify({ syncNamToneAssets })
             });
             if (result.source) {
-                state.sources = state.sources.map(source => source.providerId === providerId ? result.source : source);
+                // Merge, don't replace: the PATCH response omits the computed `online`
+                // status, so replacing would flash the source "offline" until the next poll.
+                state.sources = state.sources.map(source => source.providerId === providerId ? { ...source, ...result.source } : source);
                 renderSources();
             }
             await refreshCoreLibraryProviders({ reloadOnChange: false });
@@ -377,7 +394,8 @@
                 body: JSON.stringify({ allowUnsafeRedirects })
             });
             if (result.source) {
-                state.sources = state.sources.map(source => source.providerId === providerId ? result.source : source);
+                // Merge, don't replace (see toggleNamToneSync): keep the computed `online` status.
+                state.sources = state.sources.map(source => source.providerId === providerId ? { ...source, ...result.source } : source);
                 renderSources();
             }
             await refreshCoreLibraryProviders({ reloadOnChange: false });
@@ -389,24 +407,36 @@
         }
     }
 
-    async function setToken(providerId, hasToken) {
-        const promptText = hasToken
-            ? 'Enter a new access token (leave blank to remove the current token):'
-            : 'Enter the access token for this source:';
-        const token = window.prompt(promptText, '');
-        if (token === null) return;
+    function toggleTokenEditor(providerId) {
+        state.tokenEditor = state.tokenEditor === providerId ? null : providerId;
+        renderSources();
+        if (state.tokenEditor === providerId) {
+            const input = document.getElementById('rlc-token-input');
+            if (input) input.focus();
+        }
+    }
+
+    function closeTokenEditor() {
+        if (state.tokenEditor === null) return;
+        state.tokenEditor = null;
+        renderSources();
+    }
+
+    async function saveToken(providerId, value) {
+        const token = String(value || '').trim();
         setSourceBusy(providerId, 'token');
         try {
             const result = await api(`/sources/${encodeURIComponent(providerId)}`, {
                 method: 'PATCH',
-                body: JSON.stringify({ token: token.trim() })
+                body: JSON.stringify({ token })
             });
+            state.tokenEditor = null;
             if (result.source) {
                 state.sources = state.sources.map(source => source.providerId === providerId ? result.source : source);
-                renderSources();
             }
+            renderSources();
             await refreshCoreLibraryProviders({ reloadOnChange: false });
-            setMessage(token.trim() ? 'Access token saved.' : 'Access token removed.', 'success');
+            setMessage(token ? 'Access token saved.' : 'Access token removed.', 'success');
             await refresh();
         } finally {
             setSourceBusy(providerId, '');
@@ -432,7 +462,7 @@
         if (state.installed) return;
         state.installed = true;
         document.addEventListener('click', async event => {
-            const target = event.target.closest('[data-rlc-toggle-add],[data-rlc-cancel-add],[data-rlc-refresh-source],[data-rlc-toggle-source],[data-rlc-token],[data-rlc-remove],[data-rlc-open-screen]');
+            const target = event.target.closest('[data-rlc-toggle-add],[data-rlc-cancel-add],[data-rlc-refresh-source],[data-rlc-toggle-source],[data-rlc-token],[data-rlc-token-cancel],[data-rlc-token-clear],[data-rlc-remove],[data-rlc-open-screen]');
             if (!target) return;
             if (target.disabled) return;
             try {
@@ -440,7 +470,9 @@
                 if (target.matches('[data-rlc-cancel-add]')) setAddFormOpen(false);
                 if (target.matches('[data-rlc-refresh-source]')) await refreshSource(target.getAttribute('data-rlc-refresh-source'));
                 if (target.matches('[data-rlc-toggle-source]')) await toggleSource(target.getAttribute('data-rlc-toggle-source'), target.getAttribute('data-rlc-enabled') !== 'true');
-                if (target.matches('[data-rlc-token]')) await setToken(target.getAttribute('data-rlc-token'), target.getAttribute('data-rlc-has-token') === 'true');
+                if (target.matches('[data-rlc-token]')) toggleTokenEditor(target.getAttribute('data-rlc-token'));
+                if (target.matches('[data-rlc-token-cancel]')) closeTokenEditor();
+                if (target.matches('[data-rlc-token-clear]')) await saveToken(target.getAttribute('data-rlc-token-clear'), '');
                 if (target.matches('[data-rlc-remove]')) await removeSource(target.getAttribute('data-rlc-remove'));
                 if (target.matches('[data-rlc-open-screen]')) window.location.hash = '#remote-library-client';
             } catch (error) {
@@ -448,12 +480,25 @@
             }
         });
         document.addEventListener('submit', async event => {
-            if (!event.target.matches('[data-rlc-form]')) return;
-            event.preventDefault();
-            try {
-                await addSource();
-            } catch (error) {
-                setMessage(error.message || 'Action failed.', 'error');
+            if (event.target.matches('[data-rlc-form]')) {
+                event.preventDefault();
+                try {
+                    await addSource();
+                } catch (error) {
+                    setMessage(error.message || 'Action failed.', 'error');
+                }
+                return;
+            }
+            if (event.target.matches('[data-rlc-token-form]')) {
+                event.preventDefault();
+                const providerId = event.target.getAttribute('data-rlc-token-form');
+                const input = document.getElementById('rlc-token-input');
+                try {
+                    await saveToken(providerId, input ? input.value : '');
+                } catch (error) {
+                    setMessage(error.message || 'Action failed.', 'error');
+                }
+                return;
             }
         });
         document.addEventListener('change', async event => {
@@ -490,7 +535,10 @@
             if (!state.statusTimer) {
                 state.statusTimer = window.setInterval(() => {
                     if (document.getElementById('remote-library-client-root')) {
-                        renderSources();
+                        // Don't rebuild the list while a token editor is open — it
+                        // would wipe the in-progress input. The age labels refresh
+                        // on the next tick after the editor closes.
+                        if (!state.tokenEditor) renderSources();
                         return;
                     }
                     window.clearInterval(state.statusTimer);

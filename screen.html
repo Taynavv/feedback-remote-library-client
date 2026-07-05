@@ -15,8 +15,8 @@
       </div>
     </div>
 
-    <form id="remote-library-client-add-form" class="hidden rounded-xl border border-gray-800/50 bg-dark-700/50 p-4" data-rlc-form>
-      <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(12rem,0.45fr)_auto] md:items-end">
+    <form id="remote-library-client-add-form" class="hidden space-y-3 rounded-xl border border-gray-800/50 bg-dark-700/50 p-4" data-rlc-form>
+      <div class="grid gap-3 md:grid-cols-2 md:items-end">
         <label class="space-y-1 text-sm text-gray-300">
           <span class="block text-xs uppercase text-gray-500">Server URL</span>
           <input id="rlc-base-url" type="text" required class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent/50" style="background:#0f172a;color:#f8fafc;" placeholder="studio.local" />
@@ -24,6 +24,12 @@
         <label class="space-y-1 text-sm text-gray-300">
           <span class="block text-xs uppercase text-gray-500">Label</span>
           <input id="rlc-label" type="text" class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent/50" style="background:#0f172a;color:#f8fafc;" placeholder="Studio laptop" />
+        </label>
+      </div>
+      <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
+        <label class="space-y-1 text-sm text-gray-300">
+          <span class="block text-xs uppercase text-gray-500">Access token <span class="normal-case text-gray-600">(only if the server requires one)</span></span>
+          <input id="rlc-token" type="password" autocomplete="off" class="w-full rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent/50" style="background:#0f172a;color:#f8fafc;" placeholder="Leave blank if the server is open" />
         </label>
         <div class="flex gap-2">
           <button class="rounded-lg bg-accent px-4 py-2 text-sm font-semibold text-white transition hover:bg-accent-light" type="submit">Add</button>
