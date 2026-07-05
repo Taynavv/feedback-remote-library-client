@@ -7,10 +7,15 @@ from urllib import error
 import pytest
 
 from remote_library_client.provider import (
-    DirectLibraryProvider,
     MAX_ERROR_RESPONSE_BYTES,
     MAX_JSON_RESPONSE_BYTES,
+    AuthRequiredError,
+    DirectLibraryProvider,
+    RedirectBlockedError,
+    _GuardedRedirectHandler,
     _header_filename,
+    _host_resolves_to_internal,
+    _redirect_is_blocked,
     _sha256_bytes,
     playback_settings_key,
     provider_id_for_source,
@@ -47,7 +52,9 @@ SONGS = [
 
 
 class FakeProvider(DirectLibraryProvider):
-    def __init__(self, tmp_path, local_library_root=None, library_importer=None, source_extra=None, nam_config_dir=None):
+    def __init__(
+        self, tmp_path, local_library_root=None, library_importer=None, source_extra=None, nam_config_dir=None
+    ):
         source = {
             "baseUrl": "https://studio.example.test",
             "providerId": provider_id_for_source("direct_studio", "https://studio.example.test"),
@@ -362,7 +369,7 @@ def test_package_download_streams_to_cache(tmp_path, monkeypatch):
             {"content-disposition": 'attachment; filename="song-one.psarc"'},
         )
 
-    monkeypatch.setattr("remote_library_client.provider.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(provider, "_urlopen", fake_urlopen)
 
     target, content_hash, byte_count, headers = provider._download_to_cache("/songs/song-one/package", "fallback.psarc")
 
@@ -391,7 +398,7 @@ def test_package_download_size_is_limited(tmp_path, monkeypatch):
             {"content-disposition": 'attachment; filename="song-one.psarc"'},
         )
 
-    monkeypatch.setattr("remote_library_client.provider.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(provider, "_urlopen", fake_urlopen)
     monkeypatch.setattr("remote_library_client.provider.MAX_PACKAGE_RESPONSE_BYTES", len(b"package") - 1)
 
     with pytest.raises(RuntimeError, match="package response exceeded size limit"):
@@ -415,7 +422,7 @@ def test_json_response_size_is_limited(tmp_path, monkeypatch):
     def fake_urlopen(req, timeout=20):
         return StreamingResponse([b"{" + b"x" * MAX_JSON_RESPONSE_BYTES], {})
 
-    monkeypatch.setattr("remote_library_client.provider.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(provider, "_urlopen", fake_urlopen)
 
     with pytest.raises(RuntimeError, match="response exceeded size limit"):
         provider._json("/source")
@@ -441,7 +448,7 @@ def test_http_error_body_size_is_limited(tmp_path, monkeypatch):
             fp=StreamingResponse([b"x" * (MAX_ERROR_RESPONSE_BYTES + 1)], {}),
         )
 
-    monkeypatch.setattr("remote_library_client.provider.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(provider, "_urlopen", fake_urlopen)
 
     with pytest.raises(RuntimeError, match="error response exceeded size limit"):
         provider._json("/source")
@@ -668,3 +675,109 @@ def test_sync_surfaces_package_download_errors(tmp_path):
 
     with pytest.raises(RuntimeError, match="package not found"):
         provider.sync_song("song-one")
+
+
+def test_host_resolves_to_internal_flags_private_loopback_and_unresolvable():
+    for host in ("127.0.0.1", "10.0.0.1", "192.168.1.5", "169.254.169.254", "::1", ""):
+        assert _host_resolves_to_internal(host) is True
+    for host in ("8.8.8.8", "93.184.216.34"):
+        assert _host_resolves_to_internal(host) is False
+
+
+def test_redirect_is_blocked_only_on_pivot_to_a_different_internal_host():
+    origin = "studio.example.test"
+    assert _redirect_is_blocked(origin, False, "http://169.254.169.254/latest/meta-data") is True
+    assert _redirect_is_blocked(origin, False, "http://127.0.0.1:9999/admin") is True
+    # Same host (scheme upgrade / path change) stays allowed.
+    assert _redirect_is_blocked(origin, False, "https://studio.example.test/other") is False
+    # A different but public host is not an internal pivot.
+    assert _redirect_is_blocked(origin, False, "http://8.8.8.8/") is False
+    # Opting out disables the guard entirely.
+    assert _redirect_is_blocked(origin, True, "http://127.0.0.1/") is False
+
+
+def test_guarded_redirect_handler_raises_on_internal_pivot():
+    handler = _GuardedRedirectHandler("studio.example.test", allow_unsafe=False)
+    with pytest.raises(RedirectBlockedError):
+        handler.redirect_request(None, None, 302, "Found", {}, "http://169.254.169.254/")
+
+
+def test_provider_blocks_unsafe_redirects_by_default(tmp_path):
+    guarded = DirectLibraryProvider(
+        {"baseUrl": "https://studio.example.test", "providerId": "direct:studio:test", "label": "Studio"},
+        tmp_path,
+    )
+    assert guarded.allow_unsafe_redirects is False
+
+    opted_out = DirectLibraryProvider(
+        {
+            "baseUrl": "https://studio.example.test",
+            "providerId": "direct:studio:test",
+            "label": "Studio",
+            "allowUnsafeRedirects": True,
+        },
+        tmp_path,
+    )
+    assert opted_out.allow_unsafe_redirects is True
+
+
+def _auth_provider(tmp_path, token):
+    return DirectLibraryProvider(
+        {
+            "baseUrl": "https://studio.example.test",
+            "providerId": "direct:studio:test",
+            "label": "Studio",
+            "token": token,
+        },
+        tmp_path,
+    )
+
+
+def test_provider_sends_bearer_token_header(tmp_path):
+    provider = _auth_provider(tmp_path, "s3cret")
+    captured = {}
+
+    def fake_open(req, timeout=20):
+        captured["auth"] = req.get_header("Authorization")
+        captured["url"] = req.full_url
+        return StreamingResponse([b"{}"], {})
+
+    provider._urlopen = fake_open
+    provider._json("/source")
+
+    assert captured["auth"] == "Bearer s3cret"
+    assert "token=" not in captured["url"]
+
+
+def test_provider_non_ascii_token_falls_back_to_query_param(tmp_path):
+    provider = _auth_provider(tmp_path, "tökén")
+    captured = {}
+
+    def fake_open(req, timeout=20):
+        captured["auth"] = req.get_header("Authorization")
+        captured["url"] = req.full_url
+        return StreamingResponse([b"{}"], {})
+
+    provider._urlopen = fake_open
+    provider._json("/source")
+
+    assert captured["auth"] is None
+    assert "token=" in captured["url"]
+
+
+def test_provider_raises_auth_required_on_401(tmp_path):
+    provider = _auth_provider(tmp_path, "")
+
+    def fake_open(req, timeout=20):
+        raise error.HTTPError(
+            req.full_url,
+            401,
+            "Unauthorized",
+            hdrs=None,
+            fp=StreamingResponse([b'{"detail":"invalid or missing auth token"}'], {}),
+        )
+
+    provider._urlopen = fake_open
+
+    with pytest.raises(AuthRequiredError):
+        provider._json("/source")

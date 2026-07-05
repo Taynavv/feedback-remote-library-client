@@ -6,7 +6,13 @@ from urllib import parse
 
 from fastapi import HTTPException
 
-from remote_library_client.provider import DirectLibraryProvider, _public_error_message, provider_id_for_source
+from remote_library_client.provider import (
+    AuthRequiredError,
+    DirectLibraryProvider,
+    _public_error_message,
+    _safe_int,
+    provider_id_for_source,
+)
 from remote_library_client.store import RemoteLibraryClientStore
 
 _store: RemoteLibraryClientStore | None = None
@@ -65,11 +71,14 @@ def _candidate_base_urls(value: str) -> list[str]:
     return unique_candidates
 
 
-def _probe_first_available(value: str) -> tuple[str, dict]:
+def _probe_first_available(value: str, token: str = "") -> tuple[str, dict]:
     errors = []
     for base_url in _candidate_base_urls(value):
         try:
-            return base_url, _probe_source(base_url)
+            return base_url, _probe_source(base_url, token)
+        except AuthRequiredError:
+            # The server answered — it just needs a token. Stop laddering and surface that.
+            raise
         except Exception as exc:
             errors.append(f"{base_url}: {exc}")
     detail = "Could not connect to a Remote Library Server."
@@ -122,11 +131,12 @@ def _unregister_source_provider(provider_id: str) -> None:
             pass
 
 
-def _probe_source(base_url: str) -> dict:
+def _probe_source(base_url: str, token: str = "") -> dict:
     probe = DirectLibraryProvider({
         "baseUrl": base_url,
         "providerId": provider_id_for_source("probe", base_url),
         "label": base_url,
+        "token": token,
     }, _source_cache_dir())
     return probe._json("/source", timeout=3)
 
@@ -142,10 +152,11 @@ def _source_from_payload(base_url: str, payload: dict, label: str = "") -> dict:
         "sourceName": source_name,
         "label": label or source_name,
         "protocol": (payload.get("server") or {}).get("protocol") or "slopsmith-direct-library.v1",
-        "songCount": int(payload.get("songCount") or 0),
+        "songCount": _safe_int(payload.get("songCount"), 0),
         "remoteCapabilities": list(payload.get("capabilities") or []),
         "namToneSyncAvailable": bool((payload.get("namToneSync") or {}).get("enabled"))
             or "nam-tone-sync.read" in set(payload.get("capabilities") or []),
+        "authRequired": bool((payload.get("auth") or {}).get("required")),
         "enabled": True,
         "lastSuccessfulContactAt": _utc_now_iso(),
     }
@@ -173,6 +184,8 @@ def _save_checked_source(source: dict, payload: dict) -> dict:
         **_source_from_payload(source.get("baseUrl") or "", payload, source.get("label") or ""),
         "enabled": _source_enabled(source),
         "syncNamToneAssets": bool(source.get("syncNamToneAssets")),
+        "allowUnsafeRedirects": bool(source.get("allowUnsafeRedirects")),
+        "token": str(source.get("token") or ""),
     }
     old_provider_id = source.get("providerId") or ""
     new_provider_id = updated.get("providerId") or ""
@@ -181,7 +194,12 @@ def _save_checked_source(source: dict, payload: dict) -> dict:
         _unregister_source_provider(old_provider_id)
     provider = _register_source_provider(updated, replace=True)
     _store.upsert_source(updated)
-    return {**updated, "registered": bool(provider and provider.id in _providers), "online": bool(payload.get("ok", True)), "message": ""}
+    return {
+        **updated,
+        "registered": bool(provider and provider.id in _providers),
+        "online": bool(payload.get("ok", True)),
+        "message": "",
+    }
 
 
 def _provider_payload(provider: DirectLibraryProvider | None) -> dict | None:
@@ -190,8 +208,16 @@ def _provider_payload(provider: DirectLibraryProvider | None) -> dict | None:
     return {"id": provider.id, "label": provider.label}
 
 
+def _public_source(source: dict) -> dict:
+    # Never echo the stored token back to the browser; expose only whether one is set.
+    public = {key: value for key, value in source.items() if key != "token"}
+    public["hasToken"] = bool(str(source.get("token") or "").strip())
+    return public
+
+
 def setup(app, context):
-    global _store, _register_provider, _unregister_provider, _cache_dir, _get_dlc_dir, _extract_meta, _meta_db, _config_dir
+    global _store, _register_provider, _unregister_provider, _cache_dir
+    global _get_dlc_dir, _extract_meta, _meta_db, _config_dir
     _config_dir = Path(context["config_dir"])
     _store = RemoteLibraryClientStore(_config_dir)
     _register_provider = context.get("register_library_provider")
@@ -209,7 +235,8 @@ def setup(app, context):
 
     @app.get("/api/plugins/remote_library_client/settings")
     def get_settings():
-        return _store.load()
+        data = _store.load()
+        return {"sources": [_public_source(item) for item in data.get("sources") or []]}
 
     @app.get("/api/plugins/remote_library_client/status")
     def status():
@@ -225,25 +252,39 @@ def setup(app, context):
             }
             if not _source_enabled(source):
                 item["message"] = "Disabled"
-                sources.append(item)
+                sources.append(_public_source(item))
                 continue
             try:
-                payload = _probe_source(source.get("baseUrl") or "")
+                payload = _probe_source(source.get("baseUrl") or "", source.get("token") or "")
                 item.update(_save_checked_source(source, payload))
+            except AuthRequiredError:
+                item["authRequired"] = True
+                item["message"] = (
+                    "Access token rejected" if str(source.get("token") or "").strip() else "Access token required"
+                )
             except Exception as exc:
                 item["message"] = _public_error_message(exc)
-            sources.append(item)
+            sources.append(_public_source(item))
         return {"sources": sources, "providerSupport": callable(_register_provider)}
 
     @app.post("/api/plugins/remote_library_client/sources")
     def add_source(data: dict):
+        token = str(data.get("token") or "").strip()
         try:
-            base_url, payload = _probe_first_available(data.get("baseUrl") or data.get("url") or "")
+            base_url, payload = _probe_first_available(data.get("baseUrl") or data.get("url") or "", token)
             label = str(data.get("label") or "").strip()
-            source = {**_source_from_payload(base_url, payload, label), "syncNamToneAssets": bool(data.get("syncNamToneAssets"))}
+            source = {
+                **_source_from_payload(base_url, payload, label),
+                "syncNamToneAssets": bool(data.get("syncNamToneAssets")),
+                "allowUnsafeRedirects": bool(data.get("allowUnsafeRedirects")),
+                "token": token,
+            }
             provider = _register_source_provider(source, replace=True)
             _store.upsert_source(source)
-            return {"ok": True, "source": source, "provider": _provider_payload(provider)}
+            return {"ok": True, "source": _public_source(source), "provider": _provider_payload(provider)}
+        except AuthRequiredError as exc:
+            message = "The access token was rejected." if token else "This server requires an access token."
+            raise HTTPException(status_code=401, detail=message) from exc
         except Exception as exc:
             raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
 
@@ -253,13 +294,17 @@ def setup(app, context):
         if not source:
             raise HTTPException(status_code=404, detail="source not found")
         if not _source_enabled(source):
-            return {"ok": True, "source": {**source, "enabled": False, "online": False, "message": "Disabled"}}
+            disabled = {**source, "enabled": False, "online": False, "message": "Disabled"}
+            return {"ok": True, "source": _public_source(disabled)}
         try:
-            payload = _probe_source(source.get("baseUrl") or "")
+            payload = _probe_source(source.get("baseUrl") or "", source.get("token") or "")
             updated = _save_checked_source(source, payload)
             provider_id = updated.get("providerId") or ""
             provider = _providers.get(provider_id)
-            return {"ok": True, "source": updated, "provider": _provider_payload(provider)}
+            return {"ok": True, "source": _public_source(updated), "provider": _provider_payload(provider)}
+        except AuthRequiredError as exc:
+            message = "Access token rejected" if str(source.get("token") or "").strip() else "Access token required"
+            raise HTTPException(status_code=401, detail=message) from exc
         except Exception as exc:
             raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
 
@@ -268,7 +313,7 @@ def setup(app, context):
         source = next((item for item in _store.list_sources() if item.get("providerId") == provider_id), None)
         if not source:
             raise HTTPException(status_code=404, detail="source not found")
-        allowed = {"enabled", "syncNamToneAssets"}
+        allowed = {"enabled", "syncNamToneAssets", "allowUnsafeRedirects", "token"}
         if not any(key in data for key in allowed):
             raise HTTPException(status_code=400, detail="no supported source settings provided")
         updated = dict(source)
@@ -276,16 +321,20 @@ def setup(app, context):
             updated["enabled"] = bool(data.get("enabled"))
         if "syncNamToneAssets" in data:
             updated["syncNamToneAssets"] = bool(data.get("syncNamToneAssets"))
+        if "allowUnsafeRedirects" in data:
+            updated["allowUnsafeRedirects"] = bool(data.get("allowUnsafeRedirects"))
+        if "token" in data:
+            updated["token"] = str(data.get("token") or "").strip()
         if _source_enabled(updated):
             try:
                 provider = _register_source_provider(updated, replace=True)
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
             _store.upsert_source(updated)
-            return {"ok": True, "source": updated, "provider": _provider_payload(provider)}
+            return {"ok": True, "source": _public_source(updated), "provider": _provider_payload(provider)}
         _store.upsert_source(updated)
         _unregister_source_provider(provider_id)
-        return {"ok": True, "source": updated, "provider": None}
+        return {"ok": True, "source": _public_source(updated), "provider": None}
 
     @app.delete("/api/plugins/remote_library_client/sources/{provider_id:path}")
     def remove_source(provider_id: str):

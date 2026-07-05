@@ -38,6 +38,22 @@ locally.
   non-fatal path.
 - **Metadata reads are defensive** (`song.get("stem_ids") or song.get("stemIds")`),
   tolerating snake_case and camelCase from either server generation. Keep both.
+- **Bearer-token auth (server v0.2.1+).** A per-source `token` is sent as
+  `Authorization: Bearer <token>`, with a `?token=` query fallback for non-ASCII tokens
+  (HTTP headers are Latin-1 only). A remote `401` becomes `AuthRequiredError`; `add`/probe
+  turn that into a prompt-for-token flow, and `/source`'s `auth.required` is stored as
+  `authRequired`. **The token is a secret: `_public_source` strips it from every API
+  response** (the UI only ever sees `hasToken`). Keep it out of responses and logs.
+- **Redirect SSRF guard is on by default.** `_GuardedRedirectHandler` refuses a redirect
+  that pivots to a *different* internal/loopback/link-local host; the per-source
+  `allowUnsafeRedirects` flag opts out. The originally-configured host and same-host
+  redirects are always allowed, so LAN/localhost servers keep working. Don't route
+  requests around `self._urlopen` (that's what installs the guard).
+- **`settingsKey` is server-owned and opaque.** Use the server's `settingsKey` /
+  `sourceSettingsKey` / `targetSettingsKey` verbatim; never recompute them. The client's
+  own `playback_settings_key` derives the key for the *locally-imported* file and must
+  match FeedBack core's derivation — that client↔core contract (not the server's) is the
+  thing to validate if NAM mappings ever fail to resolve at playback.
 
 ## Rules
 
@@ -51,6 +67,8 @@ locally.
 
 ```bash
 python -m venv .venv
-.venv/Scripts/pip install pytest fastapi httpx
-.venv/Scripts/python -m pytest -q
+# Activate:  Windows: .venv\Scripts\activate  |  macOS/Linux: source .venv/bin/activate
+pip install pytest fastapi httpx ruff
+ruff check .   # CI gate: E, F, I rules, line-length 120
+pytest -q
 ```

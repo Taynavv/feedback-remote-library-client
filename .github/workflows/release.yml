@@ -18,7 +18,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python deps
-        run: pip install pytest fastapi httpx
+        run: pip install pytest fastapi httpx ruff
+
+      - name: Lint
+        run: ruff check .
 
       - name: Run tests
         run: pytest -v
@@ -38,8 +41,19 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           NAME="feedback-remote-library-client"
           mkdir -p "dist/$NAME"
-          cp -r plugin.json routes.py screen.html screen.js settings.html              remote_library_client README.md LICENSE "dist/$NAME/"
+          cp -r plugin.json routes.py screen.html screen.js settings.html assets remote_library_client README.md LICENSE "dist/$NAME/"
           find "dist/$NAME" -name '__pycache__' -type d -prune -exec rm -rf {} +
+          # Fail the build if the manifest references a file that did not get packaged
+          python - "$NAME" <<'PY'
+          import json, sys
+          from pathlib import Path
+          root = Path("dist") / sys.argv[1]
+          manifest = json.loads((root / "plugin.json").read_text())
+          missing = [manifest[k] for k in ("icon", "screen", "script", "routes")
+                     if manifest.get(k) and not (root / manifest[k]).exists()]
+          if missing:
+              sys.exit(f"packaged plugin is missing manifest-referenced files: {missing}")
+          PY
           cd dist
           zip -r "${NAME}-${VERSION}.zip" "$NAME"
           unzip -l "${NAME}-${VERSION}.zip"

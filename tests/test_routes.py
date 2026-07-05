@@ -7,6 +7,8 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from remote_library_client.provider import AuthRequiredError
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -18,7 +20,7 @@ def test_add_source_registers_library_provider(tmp_path, monkeypatch):
     registered = {}
     unregistered = []
 
-    def probe(base_url: str) -> dict:
+    def probe(base_url: str, token: str = "") -> dict:
         assert base_url == "https://studio.example.test:8765"
         return {
             "ok": True,
@@ -64,7 +66,7 @@ def test_add_source_discovers_default_port_and_protocol(tmp_path, monkeypatch):
     routes = importlib.reload(routes)
     probe_calls = []
 
-    def probe(base_url: str) -> dict:
+    def probe(base_url: str, token: str = "") -> dict:
         probe_calls.append(base_url)
         if base_url == "http://studio.local:8765":
             raise RuntimeError("connection refused")
@@ -99,7 +101,7 @@ def test_add_source_tries_explicit_url_before_default_port(tmp_path, monkeypatch
     routes = importlib.reload(routes)
     probe_calls = []
 
-    def probe(base_url: str) -> dict:
+    def probe(base_url: str, token: str = "") -> dict:
         probe_calls.append(base_url)
         assert base_url == "https://example.ngrok-free.app"
         return {
@@ -131,7 +133,7 @@ def test_add_source_strips_credentials_from_base_url(tmp_path, monkeypatch):
     routes = importlib.reload(routes)
     probe_calls = []
 
-    def probe(base_url: str) -> dict:
+    def probe(base_url: str, token: str = "") -> dict:
         probe_calls.append(base_url)
         assert base_url == "https://studio.local:9443"
         return {
@@ -166,7 +168,7 @@ def test_add_source_explicit_url_falls_back_to_default_port(tmp_path, monkeypatc
     routes = importlib.reload(routes)
     probe_calls = []
 
-    def probe(base_url: str) -> dict:
+    def probe(base_url: str, token: str = "") -> dict:
         probe_calls.append(base_url)
         if base_url == "https://studio.local":
             raise RuntimeError("connection refused")
@@ -199,7 +201,7 @@ def test_add_source_does_not_save_when_unreachable(tmp_path, monkeypatch):
     routes = importlib.import_module("routes")
     routes = importlib.reload(routes)
 
-    def probe(base_url: str) -> dict:
+    def probe(base_url: str, token: str = "") -> dict:
         raise RuntimeError(f"no route to {base_url}")
 
     monkeypatch.setattr(routes, "_probe_source", probe)
@@ -223,7 +225,7 @@ def test_add_source_does_not_save_when_registration_fails(tmp_path, monkeypatch)
     routes = importlib.import_module("routes")
     routes = importlib.reload(routes)
 
-    def probe(base_url: str) -> dict:
+    def probe(base_url: str, token: str = "") -> dict:
         return {
             "ok": True,
             "sourceId": "direct_studio",
@@ -253,7 +255,7 @@ def test_add_source_failure_scrubs_probe_error_details(tmp_path, monkeypatch):
     routes = importlib.import_module("routes")
     routes = importlib.reload(routes)
 
-    def probe(base_url: str) -> dict:
+    def probe(base_url: str, token: str = "") -> dict:
         raise RuntimeError(f"failed at https://user:secret@studio.local/private/log and {tmp_path / 'token.txt'}")
 
     monkeypatch.setattr(routes, "_probe_source", probe)
@@ -287,7 +289,7 @@ def test_status_scrubs_probe_error_details(tmp_path, monkeypatch):
         "enabled": True,
     }
 
-    def probe(base_url: str) -> dict:
+    def probe(base_url: str, token: str = "") -> dict:
         raise RuntimeError(f"failed at https://user:secret@studio.local/private/log and {tmp_path / 'token.txt'}")
 
     monkeypatch.setattr(routes, "_probe_source", probe)
@@ -317,7 +319,7 @@ def test_disable_source_unregisters_and_skips_status_probe(tmp_path, monkeypatch
     unregistered = []
     probe_calls = []
 
-    def probe(base_url: str) -> dict:
+    def probe(base_url: str, token: str = "") -> dict:
         probe_calls.append(base_url)
         return {
             "ok": True,
@@ -388,7 +390,7 @@ def test_source_patch_updates_nam_tone_sync_setting_and_provider(tmp_path, monke
     routes = importlib.reload(routes)
     registered = {}
 
-    def probe(base_url: str) -> dict:
+    def probe(base_url: str, token: str = "") -> dict:
         return {
             "ok": True,
             "sourceId": "direct_studio",
@@ -410,9 +412,173 @@ def test_source_patch_updates_nam_tone_sync_setting_and_provider(tmp_path, monke
 
     added = client.post("/api/plugins/remote_library_client/sources", json={"baseUrl": "https://studio.example.test"})
     provider_id = added.json()["provider"]["id"]
-    updated = client.patch(f"/api/plugins/remote_library_client/sources/{provider_id}", json={"syncNamToneAssets": True})
+    updated = client.patch(
+        f"/api/plugins/remote_library_client/sources/{provider_id}",
+        json={"syncNamToneAssets": True},
+    )
 
     assert updated.status_code == 200
     assert updated.json()["source"]["syncNamToneAssets"] is True
     assert updated.json()["source"]["namToneSyncAvailable"] is True
     assert registered[provider_id].source["syncNamToneAssets"] is True
+
+
+def test_source_patch_toggles_unsafe_redirects_and_rebuilds_provider(tmp_path, monkeypatch):
+    routes = importlib.import_module("routes")
+    routes = importlib.reload(routes)
+    registered = {}
+
+    def probe(base_url: str, token: str = "") -> dict:
+        return {
+            "ok": True,
+            "sourceId": "direct_studio",
+            "sourceName": "Studio Source",
+            "songCount": 12,
+            "server": {"protocol": "slopsmith-direct-library.v1"},
+        }
+
+    monkeypatch.setattr(routes, "_probe_source", probe)
+    app = FastAPI()
+    routes.setup(app, {
+        "config_dir": tmp_path / "config",
+        "register_library_provider": lambda provider, replace=False: registered.__setitem__(provider.id, provider),
+        "get_sloppak_cache_dir": lambda: tmp_path / "cache",
+    })
+    client = TestClient(app)
+
+    added = client.post("/api/plugins/remote_library_client/sources", json={"baseUrl": "https://studio.example.test"})
+    provider_id = added.json()["provider"]["id"]
+    assert registered[provider_id].allow_unsafe_redirects is False
+
+    updated = client.patch(
+        f"/api/plugins/remote_library_client/sources/{provider_id}",
+        json={"allowUnsafeRedirects": True},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["source"]["allowUnsafeRedirects"] is True
+    assert registered[provider_id].allow_unsafe_redirects is True
+    assert routes._store.list_sources()[0]["allowUnsafeRedirects"] is True
+
+
+def test_add_source_requires_token_then_succeeds_without_echoing_it(tmp_path, monkeypatch):
+    routes = importlib.import_module("routes")
+    routes = importlib.reload(routes)
+
+    def probe(base_url, token=""):
+        if not token:
+            raise AuthRequiredError("invalid or missing auth token")
+        assert token == "letmein"
+        return {
+            "ok": True,
+            "sourceId": "studio",
+            "sourceName": "Studio",
+            "songCount": 5,
+            "auth": {"required": True},
+            "server": {"protocol": "slopsmith-direct-library.v1"},
+        }
+
+    monkeypatch.setattr(routes, "_probe_source", probe)
+    app = FastAPI()
+    routes.setup(app, {
+        "config_dir": tmp_path / "config",
+        "register_library_provider": lambda provider, replace=False: None,
+        "get_sloppak_cache_dir": lambda: tmp_path / "cache",
+    })
+    client = TestClient(app)
+
+    denied = client.post("/api/plugins/remote_library_client/sources", json={"baseUrl": "https://studio.example.test"})
+    assert denied.status_code == 401
+    assert "access token" in denied.json()["detail"].lower()
+
+    added = client.post(
+        "/api/plugins/remote_library_client/sources",
+        json={"baseUrl": "https://studio.example.test", "token": "letmein"},
+    )
+    assert added.status_code == 200
+    body = added.json()
+    assert body["source"]["authRequired"] is True
+    assert body["source"]["hasToken"] is True
+    assert "token" not in body["source"]
+    assert "letmein" not in str(body)
+
+    # The persisted token drives probes but is never surfaced by status.
+    status = client.get("/api/plugins/remote_library_client/status")
+    row = status.json()["sources"][0]
+    assert row["online"] is True
+    assert row["hasToken"] is True
+    assert "token" not in row
+
+    settings = client.get("/api/plugins/remote_library_client/settings")
+    assert "letmein" not in str(settings.json())
+
+
+def test_status_flags_auth_required_when_token_missing(tmp_path, monkeypatch):
+    routes = importlib.import_module("routes")
+    routes = importlib.reload(routes)
+    source = {
+        "providerId": "direct:studio:test",
+        "baseUrl": "https://studio.example.test",
+        "sourceId": "studio",
+        "sourceName": "Studio",
+        "label": "Studio",
+        "enabled": True,
+    }
+
+    def probe(base_url, token=""):
+        raise AuthRequiredError("invalid or missing auth token")
+
+    monkeypatch.setattr(routes, "_probe_source", probe)
+    app = FastAPI()
+    routes.setup(app, {
+        "config_dir": tmp_path / "config",
+        "register_library_provider": lambda provider, replace=False: None,
+        "get_sloppak_cache_dir": lambda: tmp_path / "cache",
+    })
+    routes._store.upsert_source(source)
+    client = TestClient(app)
+
+    row = client.get("/api/plugins/remote_library_client/status").json()["sources"][0]
+
+    assert row["online"] is False
+    assert row["authRequired"] is True
+    assert row["message"] == "Access token required"
+
+
+def test_patch_sets_token_rebuilds_provider_and_hides_it(tmp_path, monkeypatch):
+    routes = importlib.import_module("routes")
+    routes = importlib.reload(routes)
+    registered = {}
+
+    def probe(base_url, token=""):
+        return {
+            "ok": True,
+            "sourceId": "studio",
+            "sourceName": "Studio",
+            "songCount": 5,
+            "server": {"protocol": "slopsmith-direct-library.v1"},
+        }
+
+    monkeypatch.setattr(routes, "_probe_source", probe)
+    app = FastAPI()
+    routes.setup(app, {
+        "config_dir": tmp_path / "config",
+        "register_library_provider": lambda provider, replace=False: registered.__setitem__(provider.id, provider),
+        "get_sloppak_cache_dir": lambda: tmp_path / "cache",
+    })
+    client = TestClient(app)
+
+    added = client.post("/api/plugins/remote_library_client/sources", json={"baseUrl": "https://studio.example.test"})
+    provider_id = added.json()["provider"]["id"]
+    assert registered[provider_id].token == ""
+
+    patched = client.patch(
+        f"/api/plugins/remote_library_client/sources/{provider_id}",
+        json={"token": "abc123"},
+    )
+
+    assert patched.status_code == 200
+    assert patched.json()["source"]["hasToken"] is True
+    assert "token" not in patched.json()["source"]
+    assert registered[provider_id].token == "abc123"
+    assert routes._store.list_sources()[0]["token"] == "abc123"

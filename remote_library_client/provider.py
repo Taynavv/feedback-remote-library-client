@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import threading
 import time
 from collections.abc import Callable
+from contextlib import closing
 from pathlib import Path
 from urllib import error, parse, request
 
@@ -20,6 +23,75 @@ MAX_JSON_RESPONSE_BYTES = 10 * 1024 * 1024
 MAX_BINARY_RESPONSE_BYTES = 256 * 1024 * 1024
 MAX_PACKAGE_RESPONSE_BYTES = 2 * 1024 * 1024 * 1024
 MAX_ERROR_RESPONSE_BYTES = 64 * 1024
+
+
+class RedirectBlockedError(RuntimeError):
+    """Raised when a server tries to redirect the client to a different internal host."""
+
+
+class AuthRequiredError(RuntimeError):
+    """Raised when the remote server rejects a request for lack of a valid auth token (HTTP 401)."""
+
+
+def _host_resolves_to_internal(host: str) -> bool:
+    """True if the host is unresolvable or resolves to a loopback/private/link-local address.
+
+    These are the SSRF pivot targets we refuse to follow a redirect to. Resolving the name
+    (rather than trusting its text) also defends against DNS-based redirect pivots.
+    """
+    if not host:
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError, ValueError):
+        return True
+    for info in infos:
+        raw = str(info[4][0]).split("%", 1)[0]
+        try:
+            addr = ipaddress.ip_address(raw)
+        except ValueError:
+            return True
+        if (
+            addr.is_loopback
+            or addr.is_private
+            or addr.is_link_local
+            or addr.is_reserved
+            or addr.is_multicast
+            or addr.is_unspecified
+        ):
+            return True
+    return False
+
+
+def _redirect_is_blocked(origin_host: str, allow_unsafe: bool, newurl: str) -> bool:
+    """A redirect is blocked only when it pivots to a *different* host that is internal.
+
+    The originally-configured host is always allowed (the whole tool exists to talk to
+    LAN/localhost servers), and so are same-host redirects (e.g. scheme upgrades, ngrok).
+    """
+    if allow_unsafe:
+        return False
+    target_host = (parse.urlparse(newurl).hostname or "").lower()
+    if target_host == (origin_host or "").lower():
+        return False
+    return _host_resolves_to_internal(target_host)
+
+
+class _GuardedRedirectHandler(request.HTTPRedirectHandler):
+    """Follows redirects like urllib's default, but refuses to pivot to a different internal host."""
+
+    def __init__(self, origin_host: str, allow_unsafe: bool) -> None:
+        super().__init__()
+        self._origin_host = (origin_host or "").lower()
+        self._allow_unsafe = allow_unsafe
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _redirect_is_blocked(self._origin_host, self._allow_unsafe, newurl):
+            raise RedirectBlockedError(
+                "server tried to redirect the request to an internal host; "
+                "enable 'Allow unsafe redirects' for this source to permit it"
+            )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
 def _read_limited(handle, limit: int) -> bytes:
@@ -44,6 +116,13 @@ def _read_error_detail(exc: error.HTTPError) -> str:
     if len(detail) > MAX_ERROR_RESPONSE_BYTES:
         return "remote error response exceeded size limit"
     return detail.decode("utf-8", errors="replace") or str(exc)
+
+
+def _remote_error(exc: error.HTTPError) -> RuntimeError:
+    detail = _read_error_detail(exc)
+    if exc.code == 401:
+        return AuthRequiredError(detail or "authentication required")
+    return RuntimeError(detail or str(exc))
 
 
 def provider_id_for_source(source_id: str, base_url: str) -> str:
@@ -139,6 +218,14 @@ def _validate_base_url(base_url: str) -> str:
     return normalized
 
 
+def _safe_int(value, default: int = 0) -> int:
+    # Server-supplied counts/totals may be missing or non-numeric; never let them raise.
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class DirectLibraryProvider:
     kind = "remote"
     capabilities = ("library.read", "art.read", "song.sync")
@@ -155,6 +242,14 @@ class DirectLibraryProvider:
     ) -> None:
         self.source = dict(source)
         self.base_url = _validate_base_url(source.get("baseUrl") or "")
+        self.allow_unsafe_redirects = bool(source.get("allowUnsafeRedirects"))
+        origin_host = parse.urlparse(self.base_url).hostname or ""
+        self._opener = request.build_opener(_GuardedRedirectHandler(origin_host, self.allow_unsafe_redirects))
+        # Optional bearer-token auth. Prefer the Authorization header; fall back to a
+        # ?token= query param only for non-ASCII tokens, which HTTP headers cannot carry.
+        self.token = str(source.get("token") or "").strip()
+        self._auth_header = f"Bearer {self.token}" if self.token and self.token.isascii() else ""
+        self._auth_query = {} if (not self.token or self.token.isascii()) else {"token": self.token}
         self.id = str(source.get("providerId") or provider_id_for_source(source.get("sourceId") or "", self.base_url))
         self.label = str(source.get("label") or source.get("sourceName") or self.base_url)
         self.cache_dir = Path(cache_dir) / sanitize_filename(self.id.replace(":", "_"))
@@ -165,18 +260,28 @@ class DirectLibraryProvider:
         self._metadata_cache: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[float, dict]] = {}
         self._metadata_cache_lock = threading.RLock()
 
+    def _urlopen(self, req, timeout):
+        # Routes every request through the redirect-guarding opener (see _GuardedRedirectHandler).
+        return self._opener.open(req, timeout=timeout)
+
+    def _headers(self) -> dict:
+        headers = {"ngrok-skip-browser-warning": "true"}
+        if self._auth_header:
+            headers["Authorization"] = self._auth_header
+        return headers
+
     def _url(self, path: str, params: dict | None = None) -> str:
-        query = f"?{parse.urlencode(params)}" if params else ""
+        merged = {**self._auth_query, **(params or {})}
+        query = f"?{parse.urlencode(merged)}" if merged else ""
         return f"{self.base_url}{path}{query}"
 
     def _json(self, path: str, params: dict | None = None, timeout: float = 20) -> dict:
-        req = request.Request(self._url(path, params), headers={"ngrok-skip-browser-warning": "true"})
+        req = request.Request(self._url(path, params), headers=self._headers())
         try:
-            with request.urlopen(req, timeout=timeout) as response:
+            with self._urlopen(req, timeout=timeout) as response:
                 return json.loads(_read_limited(response, MAX_JSON_RESPONSE_BYTES).decode("utf-8") or "{}")
         except error.HTTPError as exc:
-            detail = _read_error_detail(exc)
-            raise RuntimeError(detail or str(exc)) from exc
+            raise _remote_error(exc) from exc
 
     def _metadata_cache_key(self, path: str, params: dict | None = None) -> tuple[str, tuple[tuple[str, str], ...]]:
         normalized_params = tuple(sorted((str(key), str(value)) for key, value in (params or {}).items()))
@@ -206,23 +311,22 @@ class DirectLibraryProvider:
             self._metadata_cache.clear()
 
     def _bytes(self, path: str, params: dict | None = None) -> tuple[bytes, str, dict]:
-        req = request.Request(self._url(path, params), headers={"ngrok-skip-browser-warning": "true"})
+        req = request.Request(self._url(path, params), headers=self._headers())
         try:
-            with request.urlopen(req, timeout=120) as response:
+            with self._urlopen(req, timeout=120) as response:
                 return (
                     _read_limited(response, MAX_BINARY_RESPONSE_BYTES),
                     response.headers.get("content-type") or "application/octet-stream",
                     dict(response.headers),
                 )
         except error.HTTPError as exc:
-            detail = _read_error_detail(exc)
-            raise RuntimeError(detail or str(exc)) from exc
+            raise _remote_error(exc) from exc
 
     def _download_to_cache(self, path: str, fallback_filename: str) -> tuple[Path, str, int, dict]:
-        req = request.Request(self._url(path), headers={"ngrok-skip-browser-warning": "true"})
+        req = request.Request(self._url(path), headers=self._headers())
         tmp_path = None
         try:
-            with request.urlopen(req, timeout=120) as response:
+            with self._urlopen(req, timeout=120) as response:
                 headers = dict(response.headers)
                 filename = _header_filename(headers, fallback_filename)
                 target = self.cache_dir / filename
@@ -243,8 +347,7 @@ class DirectLibraryProvider:
                 tmp_path.replace(target)
                 return target, digest.hexdigest(), bytes_read, headers
         except error.HTTPError as exc:
-            detail = _read_error_detail(exc)
-            raise RuntimeError(detail or str(exc)) from exc
+            raise _remote_error(exc) from exc
         finally:
             if tmp_path is not None:
                 try:
@@ -362,7 +465,9 @@ class DirectLibraryProvider:
         normalized = str(expected).lower().removeprefix("sha256:")
         return actual == normalized
 
-    def _allocate_nam_asset_path(self, root: Path, name: str, content: bytes, expected_hash: str | None) -> tuple[Path, str, bool]:
+    def _allocate_nam_asset_path(
+        self, root: Path, name: str, content: bytes, expected_hash: str | None
+    ) -> tuple[Path, str, bool]:
         target = self._safe_child(root, name)
         if target is None:
             safe_name = sanitize_filename(Path(name).name, "nam-asset")
@@ -495,7 +600,7 @@ class DirectLibraryProvider:
             key = str(key or "")
             if key and key not in mapping_keys:
                 mapping_keys.append(key)
-        with sqlite3.connect(db_path) as conn:
+        with closing(sqlite3.connect(db_path)) as conn:
             self._ensure_nam_schema(conn)
             for preset in presets:
                 model_file, model_wrote = self._download_nam_asset(preset.get("modelFile"), "model")
@@ -532,7 +637,8 @@ class DirectLibraryProvider:
                 else:
                     display_name = self._unique_preset_name(conn, f"{self.label} / {name}")
                     cursor = conn.execute(
-                        "INSERT INTO presets (name, model_file, ir_file, input_gain, output_gain, gate_threshold, settings_json) "
+                        "INSERT INTO presets "
+                        "(name, model_file, ir_file, input_gain, output_gain, gate_threshold, settings_json) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (
                             display_name,
@@ -624,6 +730,7 @@ class DirectLibraryProvider:
         stem_count = song.get("stem_count", song.get("stemCount"))
         if stem_count is None:
             stem_count = len(stem_ids)
+        stem_count = _safe_int(stem_count, len(stem_ids))
         return {
             **song,
             "filename": remote_id,
@@ -638,7 +745,7 @@ class DirectLibraryProvider:
             "artist": song.get("artist") or "Unknown artist",
             "album": song.get("album") or "",
             "format": song_format,
-            "stem_count": int(stem_count or 0),
+            "stem_count": stem_count,
             "stem_ids": stem_ids,
             "localFilename": "",
             "local_filename": "",
@@ -668,7 +775,7 @@ class DirectLibraryProvider:
             self._remote_query_params(page=page, size=size, sort=sort, direction=direction, **kwargs),
         )
         songs = [self._normalize_song(song) for song in payload.get("songs") or []]
-        return songs, int(payload.get("total") or len(songs))
+        return songs, _safe_int(payload.get("total"), len(songs))
 
     def query_artists(self, letter: str = "", page: int = 0, size: int = 50, **kwargs):
         if kwargs.get("favorites_only"):
@@ -677,7 +784,7 @@ class DirectLibraryProvider:
         if letter:
             params["letter"] = letter
         payload = self._json_cached("/artists", params)
-        return self._normalize_artist_payload(payload.get("artists") or []), int(payload.get("total_artists") or 0)
+        return self._normalize_artist_payload(payload.get("artists") or []), _safe_int(payload.get("total_artists"), 0)
 
     def query_stats(self, **kwargs) -> dict:
         if kwargs.get("favorites_only"):
@@ -687,8 +794,8 @@ class DirectLibraryProvider:
             self._remote_query_params(page=0, size=1, sort="artist", direction="asc", **kwargs),
         )
         return {
-            "total_songs": int(payload.get("total_songs") or 0),
-            "total_artists": int(payload.get("total_artists") or 0),
+            "total_songs": _safe_int(payload.get("total_songs"), 0),
+            "total_artists": _safe_int(payload.get("total_artists"), 0),
             "letters": dict(payload.get("letters") or {}),
         }
 

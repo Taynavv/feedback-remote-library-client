@@ -16,7 +16,10 @@ jobs:
           python-version: "3.12"
 
       - name: Install Python deps
-        run: pip install pytest fastapi httpx
+        run: pip install pytest fastapi httpx ruff
+
+      - name: Lint
+        run: ruff check .
 
       - name: Run tests
         run: pytest -v

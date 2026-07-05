@@ -32,7 +32,7 @@
         const node = document.getElementById('remote-library-client-message');
         if (!node) return;
         node.textContent = message || '';
-        node.className = `mt-3 text-sm ${tone === 'error' ? 'text-red-300' : tone === 'success' ? 'text-green-300' : 'text-gray-400'}`;
+        node.className = `mt-2 min-h-5 text-sm ${tone === 'error' ? 'text-red-300' : tone === 'success' ? 'text-green-300' : 'text-gray-400'}`;
     }
 
     function setAddFormOpen(open, { focus = false } = {}) {
@@ -138,13 +138,25 @@
         return '<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 18V5l12-2v13M9 9l12-2M6 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0Zm15-2a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"/></svg>';
     }
 
+    function shieldIcon() {
+        return '<svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3Z"/></svg>';
+    }
+
+    function keyIcon() {
+        return '<svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a4 4 0 1 1-3.9 5H8v3H5v-3H3v-3h8.1A4 4 0 0 1 15 7Z"/></svg>';
+    }
+
     async function api(path, options) {
         const response = await fetch(`/api/plugins/remote_library_client${path}`, {
             headers: { 'Content-Type': 'application/json' },
             ...(options || {}),
         });
         const data = await response.json().catch(() => ({}));
-        if (!response.ok) throw new Error(data.detail || data.error || response.statusText);
+        if (!response.ok) {
+            const err = new Error(data.detail || data.error || response.statusText);
+            err.status = response.status;
+            throw err;
+        }
         return data;
     }
 
@@ -182,10 +194,6 @@
     function renderSources() {
         const node = document.getElementById('remote-library-client-sources');
         if (!node) return;
-        if (state.loading && !state.sources.length) {
-            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No remote sources yet. Click + to add a Remote Library Server URL.</div>';
-            return;
-        }
         if (!state.sources.length) {
             node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No remote sources yet. Click + to add a Remote Library Server URL.</div>';
             return;
@@ -197,14 +205,23 @@
             const busy = !!busyMode;
             const enabled = source.enabled !== false;
             const syncNamToneAssets = Boolean(source.syncNamToneAssets);
+            const allowUnsafeRedirects = Boolean(source.allowUnsafeRedirects);
             const toggleLabel = busyMode === 'toggle'
                 ? 'Saving source state'
                 : enabled ? 'Disable source' : 'Enable source';
             const namToneLabel = busyMode === 'tone-sync'
                 ? 'Saving NAM tone sync setting'
                 : syncNamToneAssets ? 'Disable NAM tone sync' : 'Sync NAM tones with songs';
+            const allowRedirectsLabel = busyMode === 'allow-redirects'
+                ? 'Saving redirect protection setting'
+                : allowUnsafeRedirects
+                    ? 'Redirects to internal hosts are allowed (unsafe) — uncheck to re-enable protection'
+                    : 'Redirects to internal hosts are blocked (recommended) — check only if a trusted server needs them';
             const refreshLabel = busyMode === 'refresh' ? 'Refreshing source' : 'Refresh source';
             const removeLabel = busyMode === 'remove' ? 'Removing source' : 'Remove source';
+            const tokenLabel = busyMode === 'token'
+                ? 'Saving access token'
+                : source.hasToken ? 'Change or clear access token' : 'Set access token';
             return `
             <div class="rounded-xl border border-gray-800/50 bg-dark-700/50 p-4 transition hover:border-accent/20">
                 <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -215,15 +232,21 @@
                             <span class="rounded-full border ${status.classes} px-2 py-0.5" title="${esc(status.title)}" aria-label="${esc(status.title)}">${esc(status.label)}</span>
                             <span>${esc(source.songCount || 0)} songs</span>
                             ${source.namToneSyncAvailable ? '<span class="rounded-full border border-gray-700 bg-dark-800 px-2 py-0.5 text-gray-300">NAM tones available</span>' : ''}
+                            ${source.authRequired && !source.hasToken ? '<span class="rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-red-300">Token required</span>' : (source.hasToken ? '<span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-amber-300">Token set</span>' : '')}
                         </div>
                         <label class="mt-3 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(namToneLabel)}">
                             <input type="checkbox" class="h-4 w-4 rounded border-gray-700 bg-dark-800" data-rlc-sync-nam-source="${esc(source.providerId)}" ${syncNamToneAssets ? 'checked' : ''} ${busy ? 'disabled' : ''} />
                             <span class="inline-flex items-center gap-1">${toneIcon()} NAM tones</span>
                         </label>
+                        <label class="mt-2 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(allowRedirectsLabel)}">
+                            <input type="checkbox" class="h-4 w-4 rounded border-gray-700 bg-dark-800" data-rlc-allow-redirects="${esc(source.providerId)}" ${allowUnsafeRedirects ? 'checked' : ''} ${busy ? 'disabled' : ''} />
+                            <span class="inline-flex items-center gap-1">${shieldIcon()} Allow unsafe redirects</span>
+                        </label>
                         ${offline ? `<div class='mt-2 text-xs text-red-300'>This source appears to be offline.${source.message ? ' ' + esc(source.message) : ''}</div>` : (enabled && !source.checkingStatus && source.message ? `<div class="mt-1 text-xs text-amber-300">${esc(source.message)}</div>` : '')}
                     </div>
                     <div class="flex flex-shrink-0 flex-wrap gap-2">
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg ${enabled ? 'bg-green-900/40 text-green-200 hover:bg-green-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-toggle-source="${esc(source.providerId)}" data-rlc-enabled="${enabled ? 'true' : 'false'}" aria-label="${esc(toggleLabel)}" title="${esc(toggleLabel)}" aria-pressed="${enabled ? 'true' : 'false'}" ${busy ? 'disabled' : ''}>${powerIcon(enabled)}</button>
+                        <button class="flex h-10 w-10 items-center justify-center rounded-lg ${source.hasToken ? 'bg-amber-900/40 text-amber-200 hover:bg-amber-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-token="${esc(source.providerId)}" data-rlc-has-token="${source.hasToken ? 'true' : 'false'}" aria-label="${esc(tokenLabel)}" title="${esc(tokenLabel)}" ${busy ? 'disabled' : ''}>${keyIcon()}</button>
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-dark-500 hover:text-white ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-refresh-source="${esc(source.providerId)}" aria-label="${esc(refreshLabel)}" title="${esc(refreshLabel)}" ${busy ? 'disabled' : ''}>${refreshIcon(busyMode === 'refresh')}</button>
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-red-900/50 hover:text-red-300 ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-remove="${esc(source.providerId)}" aria-label="${esc(removeLabel)}" title="${esc(removeLabel)}" ${busy ? 'disabled' : ''}>${removeIcon()}</button>
                     </div>
@@ -253,7 +276,18 @@
         setBusyState({ adding: true });
         setMessage('Adding source...', 'neutral');
         try {
-            const result = await api('/sources', { method: 'POST', body: JSON.stringify({ baseUrl, label }) });
+            let result;
+            try {
+                result = await api('/sources', { method: 'POST', body: JSON.stringify({ baseUrl, label }) });
+            } catch (error) {
+                if (error.status !== 401) throw error;
+                const token = window.prompt('This server requires an access token:', '');
+                if (!token || !token.trim()) {
+                    setMessage('Add cancelled — this server requires an access token.', 'error');
+                    return;
+                }
+                result = await api('/sources', { method: 'POST', body: JSON.stringify({ baseUrl, label, token: token.trim() }) });
+            }
             const added = result?.source || { baseUrl, label: label || baseUrl, online: false, songCount: 0 };
             const existingIndex = state.sources.findIndex(item => (item.providerId || '') === (added.providerId || ''));
             const viewItem = {
@@ -335,6 +369,50 @@
         }
     }
 
+    async function toggleAllowRedirects(providerId, allowUnsafeRedirects) {
+        setSourceBusy(providerId, 'allow-redirects');
+        try {
+            const result = await api(`/sources/${encodeURIComponent(providerId)}`, {
+                method: 'PATCH',
+                body: JSON.stringify({ allowUnsafeRedirects })
+            });
+            if (result.source) {
+                state.sources = state.sources.map(source => source.providerId === providerId ? result.source : source);
+                renderSources();
+            }
+            await refreshCoreLibraryProviders({ reloadOnChange: false });
+            setMessage(allowUnsafeRedirects
+                ? 'Unsafe redirects allowed for this source.'
+                : 'Redirect protection re-enabled for this source.', 'success');
+        } finally {
+            setSourceBusy(providerId, '');
+        }
+    }
+
+    async function setToken(providerId, hasToken) {
+        const promptText = hasToken
+            ? 'Enter a new access token (leave blank to remove the current token):'
+            : 'Enter the access token for this source:';
+        const token = window.prompt(promptText, '');
+        if (token === null) return;
+        setSourceBusy(providerId, 'token');
+        try {
+            const result = await api(`/sources/${encodeURIComponent(providerId)}`, {
+                method: 'PATCH',
+                body: JSON.stringify({ token: token.trim() })
+            });
+            if (result.source) {
+                state.sources = state.sources.map(source => source.providerId === providerId ? result.source : source);
+                renderSources();
+            }
+            await refreshCoreLibraryProviders({ reloadOnChange: false });
+            setMessage(token.trim() ? 'Access token saved.' : 'Access token removed.', 'success');
+            await refresh();
+        } finally {
+            setSourceBusy(providerId, '');
+        }
+    }
+
     async function removeSource(providerId) {
         const source = state.sources.find(item => item.providerId === providerId);
         const label = source?.label || source?.sourceName || source?.baseUrl || 'this source';
@@ -354,7 +432,7 @@
         if (state.installed) return;
         state.installed = true;
         document.addEventListener('click', async event => {
-            const target = event.target.closest('[data-rlc-toggle-add],[data-rlc-cancel-add],[data-rlc-refresh-source],[data-rlc-toggle-source],[data-rlc-remove],[data-rlc-open-screen]');
+            const target = event.target.closest('[data-rlc-toggle-add],[data-rlc-cancel-add],[data-rlc-refresh-source],[data-rlc-toggle-source],[data-rlc-token],[data-rlc-remove],[data-rlc-open-screen]');
             if (!target) return;
             if (target.disabled) return;
             try {
@@ -362,6 +440,7 @@
                 if (target.matches('[data-rlc-cancel-add]')) setAddFormOpen(false);
                 if (target.matches('[data-rlc-refresh-source]')) await refreshSource(target.getAttribute('data-rlc-refresh-source'));
                 if (target.matches('[data-rlc-toggle-source]')) await toggleSource(target.getAttribute('data-rlc-toggle-source'), target.getAttribute('data-rlc-enabled') !== 'true');
+                if (target.matches('[data-rlc-token]')) await setToken(target.getAttribute('data-rlc-token'), target.getAttribute('data-rlc-has-token') === 'true');
                 if (target.matches('[data-rlc-remove]')) await removeSource(target.getAttribute('data-rlc-remove'));
                 if (target.matches('[data-rlc-open-screen]')) window.location.hash = '#remote-library-client';
             } catch (error) {
@@ -378,13 +457,25 @@
             }
         });
         document.addEventListener('change', async event => {
-            const input = event.target.closest('[data-rlc-sync-nam-source]');
-            if (!input) return;
-            try {
-                await toggleNamToneSync(input.getAttribute('data-rlc-sync-nam-source'), input.checked);
-            } catch (error) {
-                input.checked = !input.checked;
-                setMessage(error.message || 'Action failed.', 'error');
+            const namInput = event.target.closest('[data-rlc-sync-nam-source]');
+            if (namInput) {
+                try {
+                    await toggleNamToneSync(namInput.getAttribute('data-rlc-sync-nam-source'), namInput.checked);
+                } catch (error) {
+                    namInput.checked = !namInput.checked;
+                    setMessage(error.message || 'Action failed.', 'error');
+                }
+                return;
+            }
+            const redirectInput = event.target.closest('[data-rlc-allow-redirects]');
+            if (redirectInput) {
+                try {
+                    await toggleAllowRedirects(redirectInput.getAttribute('data-rlc-allow-redirects'), redirectInput.checked);
+                } catch (error) {
+                    redirectInput.checked = !redirectInput.checked;
+                    setMessage(error.message || 'Action failed.', 'error');
+                }
+                return;
             }
         });
     }
