@@ -4,6 +4,7 @@
   "version": "0.2.1",
   "feedback_target": "0.3.0-alpha.1",
   "private": false,
+  "license": "AGPL-3.0-or-later",
   "nav": { "label": "Remote Client", "screen": "remote-library-client" },
   "screen": "screen.html",
   "script": "screen.js",

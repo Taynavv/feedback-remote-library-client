@@ -37,3 +37,9 @@ def test_manifest_does_not_declare_private_remote_client_domain():
     assert "consumer" not in manifest["capabilities"]["library"]["roles"]
     assert "commands" not in manifest["capabilities"]["library"]
     assert "events" not in manifest["capabilities"]["library"]
+
+
+def test_manifest_declares_license():
+    manifest = _manifest()
+
+    assert manifest.get("license") == "AGPL-3.0-or-later"
