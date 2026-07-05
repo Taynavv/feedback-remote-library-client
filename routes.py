@@ -162,22 +162,6 @@ def _source_from_payload(base_url: str, payload: dict, label: str = "") -> dict:
     }
 
 
-def _source_fallback(base_url: str, label: str = "") -> dict:
-    source_name = str(label or base_url)
-    provider_id = provider_id_for_source("", base_url)
-    return {
-        "providerId": provider_id,
-        "baseUrl": base_url,
-        "sourceId": "",
-        "sourceName": source_name,
-        "label": source_name,
-        "protocol": "slopsmith-direct-library.v1",
-        "songCount": 0,
-        "enabled": True,
-        "lastSuccessfulContactAt": "",
-    }
-
-
 def _save_checked_source(source: dict, payload: dict) -> dict:
     updated = {
         **source,
