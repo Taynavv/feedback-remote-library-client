@@ -1,22 +1,23 @@
 # feedback-remote-library-client — development guide
 
 Remote Library Client is a [FeedBack](https://github.com/got-feedback/feedBack)
-plugin (id `remote_library_client`) that registers one or more
-[Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server)
-URLs as native FeedBack **library providers**, so a remote library shows up in the
-core Library source selector and its songs can be browsed, synced, and played
-locally.
+plugin (id `remote_library_client`) that registers remote libraries as native FeedBack
+**library providers**, so a remote library shows up in the core Library source selector
+and its songs can be browsed, synced, and played locally. Two source **types** are
+supported: a [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server)
+URL (the rich REST protocol) and a public Google Drive folder of package files.
 
 ## Architecture
 
 | File | Role |
 |---|---|
-| [routes.py](routes.py) | `setup(app, context)`: connection management (add / remove / list server URLs, health probe) and wiring the provider into FeedBack's library provider coordinator; resolves the local package cache via the `get_sloppak_cache_dir` context callback |
-| [remote_library_client/provider.py](remote_library_client/provider.py) | The library-provider implementation: `query-page` / `query-artists` / `query-stats` / `tuning-names` / `get-art` / `sync-song` against a remote server, plus package download + NAM-tone asset sync into the local cache |
-| [remote_library_client/store.py](remote_library_client/store.py) | Persisted list of configured servers + per-source options |
-| [screen.html](screen.html) / [screen.js](screen.js) | Remote Client screen: add a base URL, per-source NAM-tone toggle, status |
+| [routes.py](routes.py) | `setup(app, context)`: connection management (add / remove / list sources, health probe), a `PROVIDER_TYPES` registry that dispatches each source on its stored `type` (default = direct server; Google Drive folder URLs auto-detected), and wiring providers into FeedBack's library provider coordinator; resolves the local package cache via the `get_sloppak_cache_dir` context callback |
+| [remote_library_client/provider.py](remote_library_client/provider.py) | `BaseLibraryProvider` (shared transport / cache / library-import machinery + graceful-default `get-art` / `tuning-names`) and `DirectLibraryProvider` — the Remote Library Server implementation (`query-page` / `query-artists` / `query-stats` / `tuning-names` / `get-art` / `sync-song`, package download + NAM-tone asset sync) |
+| [remote_library_client/google_drive.py](remote_library_client/google_drive.py) | `GoogleDrivePublicFolderProvider` — the `google-drive-public.v1` type: enumerate a public Drive folder, parse `Artist - Album - Title.feedpak` filenames for metadata, download packages (redirect + confirm-token flow) into the local cache |
+| [remote_library_client/store.py](remote_library_client/store.py) | Persisted list of configured sources + per-source options (including `type`) |
+| [screen.html](screen.html) / [screen.js](screen.js) | Remote Client screen: add a server URL or Drive folder link, per-source NAM-tone toggle, status; Google sources hide the token/NAM/redirect controls |
 | [settings.html](settings.html) | Settings surface |
-| [tests/](tests) | pytest, content-free: fake servers + synthetic packages |
+| [tests/](tests) | pytest, content-free: fake servers, fake Drive folders + synthetic packages |
 
 ## Load-bearing subtleties — do not "clean up" casually
 
@@ -54,6 +55,31 @@ locally.
   own `playback_settings_key` derives the key for the *locally-imported* file and must
   match FeedBack core's derivation — that client↔core contract (not the server's) is the
   thing to validate if NAM mappings ever fail to resolve at playback.
+- **Provider types dispatch on the stored `type`.** `routes.py` keys `PROVIDER_TYPES` by
+  each provider class's `type` attribute; a source with no `type` is the direct server
+  (`slopsmith-direct-library.v1`) for back-compat. `add_source` auto-detects Google Drive
+  folder URLs (`is_google_drive_folder_url`) and routes everything else to the existing
+  direct `/source` probe — the direct path is untouched. New backends subclass
+  `BaseLibraryProvider`, set a `type`, and register in `PROVIDER_TYPES`; both provider
+  classes share the `(source, cache_dir, local_root, importer, nam_config_dir)` ctor shape
+  so `_provider_for_source` can build any type uniformly.
+- **Google folder metadata is filename-derived.** `google-drive-public.v1` has no server
+  API — community folders are flat `.feedpak` dumps, so artist/album/title come from
+  parsing the `Artist - Album - Title.feedpak` name (`parse_feedpak_filename`, best-effort
+  and tolerant). Art / tunings / stats / NAM degrade to the base defaults. If a manifest
+  convention is ever adopted, it becomes an *optional* metadata source layered on top —
+  don't make filename parsing the only path.
+- **Google download is stdlib, not a dependency.** Enumeration scrapes
+  `embeddedfolderview`; download follows Drive's redirect to `drive.usercontent.google.com`
+  (allowed precisely because the SSRF guard blocks only *internal* hosts — Google's are
+  public) and streams via `_stream_response_to_cache`, with a confirm-token form fallback
+  for very large files and a clear "rate-limited, try later" error on Google's ~24h
+  per-file download lock. Keep it on `self._urlopen` (the guarded opener); do not add gdown
+  or route around the guard.
+- **`.feedpak` is the sloppak family.** `playback_settings_key` treats `.feedpak` like
+  `.sloppak`/`.zip` (feedpak == sloppak internally). Part of the client↔core
+  playback-settings-key contract above — validate against FeedBack core if feedpak NAM
+  mappings ever fail.
 
 ## Rules
 

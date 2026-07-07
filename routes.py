@@ -7,8 +7,14 @@ from urllib import parse
 
 from fastapi import HTTPException
 
+from remote_library_client.google_drive import (
+    GoogleDrivePublicFolderProvider,
+    is_google_drive_folder_url,
+    parse_drive_folder_id,
+)
 from remote_library_client.provider import (
     AuthRequiredError,
+    BaseLibraryProvider,
     DirectLibraryProvider,
     _public_error_message,
     _safe_int,
@@ -24,8 +30,16 @@ _get_dlc_dir = None
 _extract_meta = None
 _meta_db = None
 _config_dir: Path | None = None
-_providers: dict[str, DirectLibraryProvider] = {}
+_providers: dict[str, BaseLibraryProvider] = {}
 DEFAULT_SOURCE_PORT = 8765
+
+# Registered library-provider types, keyed by the source's stored `type`. New remote
+# backends (Google Drive, ...) register here; a source with no `type` is the original
+# Remote Library Server (`slopsmith-direct-library.v1`) for backward compatibility.
+PROVIDER_TYPES = {
+    DirectLibraryProvider.type: DirectLibraryProvider,
+    GoogleDrivePublicFolderProvider.type: GoogleDrivePublicFolderProvider,
+}
 
 
 def _utc_now_iso() -> str:
@@ -94,9 +108,14 @@ def _source_cache_dir() -> Path:
     return root
 
 
-def _provider_for_source(source: dict) -> DirectLibraryProvider:
+def _source_type(source: dict) -> str:
+    return str(source.get("type") or DirectLibraryProvider.type)
+
+
+def _provider_for_source(source: dict) -> BaseLibraryProvider:
     local_root = _get_dlc_dir() if callable(_get_dlc_dir) else None
-    return DirectLibraryProvider(source, _source_cache_dir(), local_root, _import_library_file, _config_dir)
+    provider_cls = PROVIDER_TYPES.get(_source_type(source), DirectLibraryProvider)
+    return provider_cls(source, _source_cache_dir(), local_root, _import_library_file, _config_dir)
 
 
 def _import_library_file(package_path: Path, local_root: Path) -> dict | None:
@@ -187,7 +206,56 @@ def _save_checked_source(source: dict, payload: dict) -> dict:
     }
 
 
-def _provider_payload(provider: DirectLibraryProvider | None) -> dict | None:
+def _google_source(seed: dict) -> dict:
+    """Build (or refresh) a Google Drive public-folder source from user input or a stored
+    record: normalize the folder URL, construct the provider, and enumerate the folder to
+    validate reachability and count songs. Raises if the folder is not reachable."""
+    folder_id = parse_drive_folder_id(seed.get("baseUrl") or seed.get("folderId") or "")
+    if not folder_id:
+        raise ValueError("not a recognizable Google Drive folder URL")
+    base_url = f"https://drive.google.com/drive/folders/{folder_id}"
+    source = {
+        **seed,
+        "type": GoogleDrivePublicFolderProvider.type,
+        "baseUrl": base_url,
+        "folderId": folder_id,
+        "providerId": seed.get("providerId")
+        or provider_id_for_source(f"gdrive_{folder_id}", base_url, prefix="gdrive"),
+        "enabled": _source_enabled(seed),
+        "syncNamToneAssets": False,
+        "allowUnsafeRedirects": bool(seed.get("allowUnsafeRedirects")),
+        "token": "",
+    }
+    provider = _provider_for_source(source)
+    info = provider.describe_source()
+    label = str(seed.get("label") or "").strip()
+    source.update({
+        "sourceId": info["sourceId"],
+        "sourceName": info["sourceName"],
+        "label": label or seed.get("label") or info["sourceName"],
+        "protocol": GoogleDrivePublicFolderProvider.type,
+        "songCount": _safe_int(info.get("songCount"), 0),
+        "remoteCapabilities": list(info.get("capabilities") or []),
+        "namToneSyncAvailable": False,
+        "authRequired": False,
+        "lastSuccessfulContactAt": _utc_now_iso(),
+    })
+    return source
+
+
+def _save_checked_google_source(source: dict) -> dict:
+    updated = _google_source(source)
+    provider = _register_source_provider(updated, replace=True)
+    _store.upsert_source(updated)
+    return {
+        **updated,
+        "registered": bool(provider and provider.id in _providers),
+        "online": True,
+        "message": "",
+    }
+
+
+def _provider_payload(provider: BaseLibraryProvider | None) -> dict | None:
     if not provider:
         return None
     return {"id": provider.id, "label": provider.label}
@@ -239,6 +307,13 @@ def setup(app, context):
                 item["message"] = "Disabled"
                 sources.append(_public_source(item))
                 continue
+            if _source_type(source) == GoogleDrivePublicFolderProvider.type:
+                try:
+                    item.update(_save_checked_google_source(source))
+                except Exception as exc:
+                    item["message"] = _public_error_message(exc)
+                sources.append(_public_source(item))
+                continue
             try:
                 payload = _probe_source(source.get("baseUrl") or "", source.get("token") or "")
                 item.update(_save_checked_source(source, payload))
@@ -254,9 +329,22 @@ def setup(app, context):
 
     @app.post("/api/plugins/remote_library_client/sources")
     def add_source(data: dict):
+        raw_url = data.get("baseUrl") or data.get("url") or ""
+        if is_google_drive_folder_url(raw_url):
+            try:
+                source = _google_source({
+                    "baseUrl": raw_url,
+                    "label": str(data.get("label") or "").strip(),
+                    "allowUnsafeRedirects": bool(data.get("allowUnsafeRedirects")),
+                })
+                provider = _register_source_provider(source, replace=True)
+                _store.upsert_source(source)
+                return {"ok": True, "source": _public_source(source), "provider": _provider_payload(provider)}
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
         token = str(data.get("token") or "").strip()
         try:
-            base_url, payload = _probe_first_available(data.get("baseUrl") or data.get("url") or "", token)
+            base_url, payload = _probe_first_available(raw_url, token)
             label = str(data.get("label") or "").strip()
             source = {
                 **_source_from_payload(base_url, payload, label),
@@ -281,6 +369,13 @@ def setup(app, context):
         if not _source_enabled(source):
             disabled = {**source, "enabled": False, "online": False, "message": "Disabled"}
             return {"ok": True, "source": _public_source(disabled)}
+        if _source_type(source) == GoogleDrivePublicFolderProvider.type:
+            try:
+                updated = _save_checked_google_source(source)
+                provider = _providers.get(updated.get("providerId") or "")
+                return {"ok": True, "source": _public_source(updated), "provider": _provider_payload(provider)}
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
         try:
             payload = _probe_source(source.get("baseUrl") or "", source.get("token") or "")
             updated = _save_checked_source(source, payload)

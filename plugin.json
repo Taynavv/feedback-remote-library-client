@@ -1,7 +1,7 @@
 {
   "id": "remote_library_client",
   "name": "Remote Library Client",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "feedback_target": "0.3.0-alpha.1",
   "private": false,
   "license": "AGPL-3.0-or-later",
@@ -10,7 +10,7 @@
   "script": "screen.js",
   "routes": "routes.py",
   "category": "tools",
-  "description": "Browse and play a shared remote library.",
+  "description": "Browse and play shared remote libraries — a Remote Library Server or a public Google Drive folder.",
   "icon": "assets/thumb.svg",
   "standards": ["capability-pipelines.v1", "plugin-runtime-idempotent.v1"],
   "capabilities": {

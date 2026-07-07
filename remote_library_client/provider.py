@@ -14,6 +14,7 @@ import threading
 import time
 from collections.abc import Callable
 from contextlib import closing
+from http.cookiejar import CookieJar
 from pathlib import Path
 from urllib import error, parse, request
 
@@ -126,11 +127,11 @@ def _remote_error(exc: error.HTTPError) -> RuntimeError:
     return RuntimeError(detail or str(exc))
 
 
-def provider_id_for_source(source_id: str, base_url: str) -> str:
+def provider_id_for_source(source_id: str, base_url: str, prefix: str = "direct") -> str:
     raw = source_id or base_url
     slug = re.sub(r"[^A-Za-z0-9_.:-]+", "-", raw).strip("-_.:")[:80]
     digest = hashlib.sha1(base_url.encode("utf-8")).hexdigest()[:10]
-    return f"direct:{slug or 'source'}:{digest}"
+    return f"{prefix}:{slug or 'source'}:{digest}"
 
 
 def sanitize_filename(value: str, fallback: str = "remote-song") -> str:
@@ -184,7 +185,12 @@ def _fnv1a_base36(value: str) -> str:
 
 def playback_settings_key(filename: str, song_format: str = "") -> str:
     suffix = Path(filename or "").suffix.lower()
-    inferred_format = "psarc" if suffix == ".psarc" else "sloppak" if suffix in {".sloppak", ".zip"} else "unknown"
+    if suffix == ".psarc":
+        inferred_format = "psarc"
+    elif suffix in {".sloppak", ".feedpak", ".zip"}:
+        inferred_format = "sloppak"
+    else:
+        inferred_format = "unknown"
     source_kind = str(song_format or inferred_format)[:40] or "unknown"
     seed = str(filename or "unknown")
     suffix = _fnv1a_base36(f"{source_kind}:{seed}").rjust(7, "0")[-7:]
@@ -227,7 +233,20 @@ def _safe_int(value, default: int = 0) -> int:
         return default
 
 
-class DirectLibraryProvider:
+class BaseLibraryProvider:
+    """Shared machinery for every remote library provider type.
+
+    Holds the transport-agnostic parts that every backend reuses: the redirect-guarding
+    urllib opener, size-capped byte/stream fetchers, the metadata TTL cache, the local
+    package cache + library-import plumbing, and graceful-default Contract A operations
+    (``get_art`` -> None, ``tuning_names`` -> empty) that thin backends can inherit.
+
+    Concrete subclasses set ``self.base_url`` and implement the catalog operations
+    (``query_page`` / ``query_artists`` / ``query_stats`` / ``sync_song``) for their
+    specific remote. ``providerId`` must already be present on ``source`` (the cache dir
+    is derived from it), and ``origin_host`` seeds the SSRF redirect guard.
+    """
+
     kind = "remote"
     capabilities = ("library.read", "art.read", "song.sync")
     metadata_cache_ttl_seconds = 300
@@ -237,22 +256,25 @@ class DirectLibraryProvider:
         self,
         source: dict,
         cache_dir: Path,
+        *,
+        origin_host: str = "",
+        allow_unsafe_redirects: bool = False,
         local_library_root: Path | None = None,
         library_importer: LibraryImporter | None = None,
         nam_config_dir: Path | None = None,
     ) -> None:
         self.source = dict(source)
-        self.base_url = _validate_base_url(source.get("baseUrl") or "")
-        self.allow_unsafe_redirects = bool(source.get("allowUnsafeRedirects"))
-        origin_host = parse.urlparse(self.base_url).hostname or ""
-        self._opener = request.build_opener(_GuardedRedirectHandler(origin_host, self.allow_unsafe_redirects))
-        # Optional bearer-token auth. Prefer the Authorization header; fall back to a
-        # ?token= query param only for non-ASCII tokens, which HTTP headers cannot carry.
-        self.token = str(source.get("token") or "").strip()
-        self._auth_header = f"Bearer {self.token}" if self.token and self.token.isascii() else ""
-        self._auth_query = {} if (not self.token or self.token.isascii()) else {"token": self.token}
-        self.id = str(source.get("providerId") or provider_id_for_source(source.get("sourceId") or "", self.base_url))
-        self.label = str(source.get("label") or source.get("sourceName") or self.base_url)
+        self.allow_unsafe_redirects = bool(allow_unsafe_redirects)
+        # Per-provider cookie jar so backends that need cookies to complete a request
+        # (e.g. Google Drive's large-file download-confirmation flow) work, while cookies
+        # stay scoped to this provider's own session.
+        self._cookies = CookieJar()
+        self._opener = request.build_opener(
+            _GuardedRedirectHandler(origin_host or "", self.allow_unsafe_redirects),
+            request.HTTPCookieProcessor(self._cookies),
+        )
+        self.id = str(source.get("providerId") or "")
+        self.label = str(source.get("label") or source.get("sourceName") or "")
         self.cache_dir = Path(cache_dir) / sanitize_filename(self.id.replace(":", "_"))
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.local_library_root = Path(local_library_root) if local_library_root else None
@@ -261,60 +283,18 @@ class DirectLibraryProvider:
         self._metadata_cache: dict[tuple[str, tuple[tuple[str, str], ...]], tuple[float, dict]] = {}
         self._metadata_cache_lock = threading.RLock()
 
+    # -- HTTP primitives -------------------------------------------------
+
     def _urlopen(self, req, timeout):
         # Routes every request through the redirect-guarding opener (see _GuardedRedirectHandler).
         return self._opener.open(req, timeout=timeout)
 
-    def _headers(self) -> dict:
-        headers = {"ngrok-skip-browser-warning": "true"}
-        if self._auth_header:
-            headers["Authorization"] = self._auth_header
-        return headers
-
-    def _url(self, path: str, params: dict | None = None) -> str:
-        merged = {**self._auth_query, **(params or {})}
-        query = f"?{parse.urlencode(merged)}" if merged else ""
-        return f"{self.base_url}{path}{query}"
-
-    def _json(self, path: str, params: dict | None = None, timeout: float = 20) -> dict:
-        req = request.Request(self._url(path, params), headers=self._headers())
+    def _open_bytes(
+        self, url: str, headers: dict | None = None, timeout: float = 120
+    ) -> tuple[bytes, str, dict]:
+        req = request.Request(url, headers=headers or {})
         try:
             with self._urlopen(req, timeout=timeout) as response:
-                return json.loads(_read_limited(response, MAX_JSON_RESPONSE_BYTES).decode("utf-8") or "{}")
-        except error.HTTPError as exc:
-            raise _remote_error(exc) from exc
-
-    def _metadata_cache_key(self, path: str, params: dict | None = None) -> tuple[str, tuple[tuple[str, str], ...]]:
-        normalized_params = tuple(sorted((str(key), str(value)) for key, value in (params or {}).items()))
-        return path, normalized_params
-
-    def _json_cached(self, path: str, params: dict | None = None, timeout: float = 20) -> dict:
-        key = self._metadata_cache_key(path, params)
-        now = time.monotonic()
-        with self._metadata_cache_lock:
-            cached = self._metadata_cache.get(key)
-            if cached and now - cached[0] <= self.metadata_cache_ttl_seconds:
-                return copy.deepcopy(cached[1])
-            if cached:
-                self._metadata_cache.pop(key, None)
-
-        payload = self._json(path, params, timeout=timeout)
-
-        with self._metadata_cache_lock:
-            if len(self._metadata_cache) >= self.metadata_cache_max_entries:
-                oldest_key = min(self._metadata_cache, key=lambda item: self._metadata_cache[item][0])
-                self._metadata_cache.pop(oldest_key, None)
-            self._metadata_cache[key] = (now, copy.deepcopy(payload))
-        return payload
-
-    def clear_metadata_cache(self) -> None:
-        with self._metadata_cache_lock:
-            self._metadata_cache.clear()
-
-    def _bytes(self, path: str, params: dict | None = None) -> tuple[bytes, str, dict]:
-        req = request.Request(self._url(path, params), headers=self._headers())
-        try:
-            with self._urlopen(req, timeout=120) as response:
                 return (
                     _read_limited(response, MAX_BINARY_RESPONSE_BYTES),
                     response.headers.get("content-type") or "application/octet-stream",
@@ -323,38 +303,75 @@ class DirectLibraryProvider:
         except error.HTTPError as exc:
             raise _remote_error(exc) from exc
 
-    def _download_to_cache(self, path: str, fallback_filename: str) -> tuple[Path, str, int, dict]:
-        req = request.Request(self._url(path), headers=self._headers())
-        tmp_path = None
+    def _stream_response_to_cache(self, response, fallback_filename: str) -> tuple[Path, str, int, dict]:
+        # Streams an already-open response into the cache with a size cap and atomic
+        # rename. Split out so a backend that must inspect the response first (e.g. Google
+        # Drive's download-confirmation interstitial) can reuse the same safe streaming.
+        response_headers = dict(response.headers)
+        filename = _header_filename(response_headers, fallback_filename)
+        target = self.cache_dir / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            digest = hashlib.sha256()
+            bytes_read = 0
+            with tmp_path.open("wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    bytes_read += len(chunk)
+                    if bytes_read > MAX_PACKAGE_RESPONSE_BYTES:
+                        raise RuntimeError("remote package response exceeded size limit")
+                    digest.update(chunk)
+                    handle.write(chunk)
+            tmp_path.replace(target)
+            return target, digest.hexdigest(), bytes_read, response_headers
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _download_url_to_cache(
+        self, url: str, fallback_filename: str, headers: dict | None = None
+    ) -> tuple[Path, str, int, dict]:
+        req = request.Request(url, headers=headers or {})
         try:
             with self._urlopen(req, timeout=120) as response:
-                headers = dict(response.headers)
-                filename = _header_filename(headers, fallback_filename)
-                target = self.cache_dir / filename
-                target.parent.mkdir(parents=True, exist_ok=True)
-                tmp_path = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-                digest = hashlib.sha256()
-                bytes_read = 0
-                with tmp_path.open("wb") as handle:
-                    while True:
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        bytes_read += len(chunk)
-                        if bytes_read > MAX_PACKAGE_RESPONSE_BYTES:
-                            raise RuntimeError("remote package response exceeded size limit")
-                        digest.update(chunk)
-                        handle.write(chunk)
-                tmp_path.replace(target)
-                return target, digest.hexdigest(), bytes_read, headers
+                return self._stream_response_to_cache(response, fallback_filename)
         except error.HTTPError as exc:
             raise _remote_error(exc) from exc
-        finally:
-            if tmp_path is not None:
-                try:
-                    tmp_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+
+    # -- metadata TTL cache ----------------------------------------------
+
+    def _metadata_cache_key(self, path: str, params: dict | None = None) -> tuple[str, tuple[tuple[str, str], ...]]:
+        normalized_params = tuple(sorted((str(key), str(value)) for key, value in (params or {}).items()))
+        return path, normalized_params
+
+    def _cache_get(self, key) -> dict | None:
+        now = time.monotonic()
+        with self._metadata_cache_lock:
+            cached = self._metadata_cache.get(key)
+            if cached and now - cached[0] <= self.metadata_cache_ttl_seconds:
+                return copy.deepcopy(cached[1])
+            if cached:
+                self._metadata_cache.pop(key, None)
+        return None
+
+    def _cache_put(self, key, value: dict) -> None:
+        now = time.monotonic()
+        with self._metadata_cache_lock:
+            if len(self._metadata_cache) >= self.metadata_cache_max_entries:
+                oldest_key = min(self._metadata_cache, key=lambda item: self._metadata_cache[item][0])
+                self._metadata_cache.pop(oldest_key, None)
+            self._metadata_cache[key] = (now, copy.deepcopy(value))
+
+    def clear_metadata_cache(self) -> None:
+        with self._metadata_cache_lock:
+            self._metadata_cache.clear()
+
+    # -- local package cache + library import ----------------------------
 
     def _copy_file_atomic(self, source: Path, target: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -368,6 +385,89 @@ class DirectLibraryProvider:
                 tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+    def _write_atomic(self, target: Path, content: bytes) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            tmp_path.write_bytes(content)
+            tmp_path.replace(target)
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _source_folder_name(self) -> str:
+        return safe_path_segment(self.source.get("sourceId") or self.label or self.id, "remote-source")
+
+    def _library_target(self, filename: str, content_hash: str) -> tuple[Path, str] | None:
+        if not self.local_library_root or not self.local_library_root.exists() or not self.local_library_root.is_dir():
+            return None
+        target_dir = self.local_library_root / self._source_folder_name()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = sanitize_filename(Path(filename).name, "remote-song.psarc")
+        target = target_dir / safe_name
+        if target.exists() and _sha256_file(target) == content_hash:
+            return target, target.relative_to(self.local_library_root).as_posix()
+        stem = target.stem or "remote-song"
+        suffix = target.suffix or ".psarc"
+        for index in range(1, 1000):
+            candidate = target if index == 1 else target_dir / f"{stem}-{index}{suffix}"
+            if not candidate.exists():
+                return candidate, candidate.relative_to(self.local_library_root).as_posix()
+            if _sha256_file(candidate) == content_hash:
+                return candidate, candidate.relative_to(self.local_library_root).as_posix()
+        raise RuntimeError("unable to allocate a unique local library filename")
+
+    def _import_into_library(
+        self, cache_target: Path, content_hash: str, filename: str
+    ) -> dict:
+        """Copy a synced package into the local library and index it.
+
+        Shared tail of ``sync_song`` for every provider type: allocate a unique local
+        path, copy the cached package in atomically, run FeedBack's library importer, and
+        report where the song landed. On importer failure the freshly-written file is
+        rolled back and playback falls through to the remote cache. Returns the
+        library-related fields to merge into a ``sync_song`` result.
+        """
+        library_target = self._library_target(filename, content_hash)
+        if not library_target:
+            return {"playbackSource": "remote-cache"}
+        library_path, local_filename = library_target
+        wrote_library = False
+        if not library_path.exists() or _sha256_file(library_path) != content_hash:
+            self._copy_file_atomic(cache_target, library_path)
+            wrote_library = True
+        library_import_result = None
+        if self.library_importer and self.local_library_root:
+            try:
+                library_import_result = self.library_importer(library_path, self.local_library_root)
+            except Exception as exc:
+                if wrote_library:
+                    try:
+                        library_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                return {
+                    "playbackSource": "remote-cache",
+                    "libraryImportState": "failed",
+                    "libraryImportError": _public_error_message(exc),
+                }
+        result = {
+            "filename": local_filename,
+            "localFilename": local_filename,
+            "local_filename": local_filename,
+            "playFilename": local_filename,
+            "libraryRelativePath": local_filename,
+            "libraryImportState": "indexed" if library_import_result else "staged",
+            "playbackSource": "library-folder",
+        }
+        if library_import_result:
+            result.update(library_import_result)
+        return result
+
+    # -- artwork cache ---------------------------------------------------
 
     def _art_cache_paths(self, song_id: str) -> tuple[Path, Path]:
         art_dir = self.cache_dir / "art"
@@ -399,39 +499,83 @@ class DirectLibraryProvider:
         except OSError:
             pass
 
-    def _source_folder_name(self) -> str:
-        return safe_path_segment(self.source.get("sourceId") or self.label or self.id, "remote-source")
+    # -- Contract A defaults (thin backends inherit these) ---------------
 
-    def _library_target(self, filename: str, content_hash: str) -> tuple[Path, str] | None:
-        if not self.local_library_root or not self.local_library_root.exists() or not self.local_library_root.is_dir():
-            return None
-        target_dir = self.local_library_root / self._source_folder_name()
-        target_dir.mkdir(parents=True, exist_ok=True)
-        safe_name = sanitize_filename(Path(filename).name, "remote-song.psarc")
-        target = target_dir / safe_name
-        if target.exists() and _sha256_file(target) == content_hash:
-            return target, target.relative_to(self.local_library_root).as_posix()
-        stem = target.stem or "remote-song"
-        suffix = target.suffix or ".psarc"
-        for index in range(1, 1000):
-            candidate = target if index == 1 else target_dir / f"{stem}-{index}{suffix}"
-            if not candidate.exists():
-                return candidate, candidate.relative_to(self.local_library_root).as_posix()
-            if _sha256_file(candidate) == content_hash:
-                return candidate, candidate.relative_to(self.local_library_root).as_posix()
-        raise RuntimeError("unable to allocate a unique local library filename")
+    def tuning_names(self) -> dict:
+        return {"tunings": []}
 
-    def _write_atomic(self, target: Path, content: bytes) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    def get_art(self, song_id: str):
+        return None
+
+
+class DirectLibraryProvider(BaseLibraryProvider):
+    """Provider for a Remote Library Server speaking the ``slopsmith-direct-library.v1``
+    REST protocol (``/source`` / ``/songs`` / ``/artists`` / ``/stats`` / ``/tuning-names``
+    / ``/songs/{id}/art`` / ``/songs/{id}/package`` / ``/songs/{id}/nam-tone-sync``)."""
+
+    type = "slopsmith-direct-library.v1"
+
+    def __init__(
+        self,
+        source: dict,
+        cache_dir: Path,
+        local_library_root: Path | None = None,
+        library_importer: LibraryImporter | None = None,
+        nam_config_dir: Path | None = None,
+    ) -> None:
+        base_url = _validate_base_url(source.get("baseUrl") or "")
+        origin_host = parse.urlparse(base_url).hostname or ""
+        provider_id = str(source.get("providerId") or provider_id_for_source(source.get("sourceId") or "", base_url))
+        super().__init__(
+            {**source, "providerId": provider_id},
+            cache_dir,
+            origin_host=origin_host,
+            allow_unsafe_redirects=bool(source.get("allowUnsafeRedirects")),
+            local_library_root=local_library_root,
+            library_importer=library_importer,
+            nam_config_dir=nam_config_dir,
+        )
+        self.base_url = base_url
+        self.label = str(source.get("label") or source.get("sourceName") or self.base_url)
+        # Optional bearer-token auth. Prefer the Authorization header; fall back to a
+        # ?token= query param only for non-ASCII tokens, which HTTP headers cannot carry.
+        self.token = str(source.get("token") or "").strip()
+        self._auth_header = f"Bearer {self.token}" if self.token and self.token.isascii() else ""
+        self._auth_query = {} if (not self.token or self.token.isascii()) else {"token": self.token}
+
+    def _headers(self) -> dict:
+        headers = {"ngrok-skip-browser-warning": "true"}
+        if self._auth_header:
+            headers["Authorization"] = self._auth_header
+        return headers
+
+    def _url(self, path: str, params: dict | None = None) -> str:
+        merged = {**self._auth_query, **(params or {})}
+        query = f"?{parse.urlencode(merged)}" if merged else ""
+        return f"{self.base_url}{path}{query}"
+
+    def _json(self, path: str, params: dict | None = None, timeout: float = 20) -> dict:
+        req = request.Request(self._url(path, params), headers=self._headers())
         try:
-            tmp_path.write_bytes(content)
-            tmp_path.replace(target)
-        finally:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            with self._urlopen(req, timeout=timeout) as response:
+                return json.loads(_read_limited(response, MAX_JSON_RESPONSE_BYTES).decode("utf-8") or "{}")
+        except error.HTTPError as exc:
+            raise _remote_error(exc) from exc
+
+    def _json_cached(self, path: str, params: dict | None = None, timeout: float = 20) -> dict:
+        key = self._metadata_cache_key(path, params)
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+        payload = self._json(path, params, timeout=timeout)
+        self._cache_put(key, payload)
+        return payload
+
+    def _bytes(self, path: str, params: dict | None = None) -> tuple[bytes, str, dict]:
+        return self._open_bytes(self._url(path, params), self._headers())
+
+    def _download_to_cache(self, path: str, fallback_filename: str) -> tuple[Path, str, int, dict]:
+        return self._download_url_to_cache(self._url(path), fallback_filename, self._headers())
 
     def _nam_db_path(self) -> Path | None:
         return self.nam_config_dir / "nam_tone.db" if self.nam_config_dir else None

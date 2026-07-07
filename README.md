@@ -1,19 +1,44 @@
 # Remote Library Client
 
-Remote Library Client connects [FeedBack](https://github.com/got-feedback/feedBack) to one or more direct [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server) URLs. Each configured server is registered as a FeedBack library provider, so it appears in the core Library source selector.
+Remote Library Client connects [FeedBack](https://github.com/got-feedback/feedBack) to one or more remote libraries. Each configured source is registered as a FeedBack library provider, so it appears in the core Library source selector. Two source types are supported:
+
+- **Remote Library Server** — a [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server) URL speaking the full metadata/search/artwork/NAM-tone protocol.
+- **Public Google Drive folder** — a public ("anyone with the link") Google Drive folder of package files; paste the folder link and its songs show up in FeedBack. See [Source types](#source-types).
 
 > [!CAUTION]
-> **This plugin downloads and imports arbitrary files from whatever server you point it at.**
-> A Remote Library Server you connect to fully controls the metadata, artwork, and — above all —
-> the **package files** this client downloads into your local library and then plays.
-> **Only connect to servers run by people you trust.** Don't add a URL a stranger handed you, and
+> **This plugin downloads and imports arbitrary files from whatever server or folder you point it at.**
+> A Remote Library Server — or a Google Drive folder — you connect to fully controls the metadata and,
+> above all, the **package files** this client downloads into your local library and then plays.
+> **Only connect to sources run by people you trust.** Don't add a URL a stranger handed you, and
 > don't download or play content you can't identify. A malicious or compromised server can serve
 > you a hostile file. If you connect to someone sketchy and it costs you — a trojan, junk data,
 > whatever — **that is on you, not on this project.** There is no warranty; you use it at your own risk.
 
 ## Runtime Model
 
-The plugin declares the core `library` capability as a provider. Its manifest uses provider `operations` (`query-page`, `query-artists`, `query-stats`, `tuning-names`, `get-art`, `sync-song`) because configured Remote Library Server URLs are exposed through FeedBack's native library provider coordinator. Connection management stays on the plugin's existing screen and backend routes; those UI actions are not declared as a separate capability domain.
+The plugin declares the core `library` capability as a provider. Its manifest uses provider `operations` (`query-page`, `query-artists`, `query-stats`, `tuning-names`, `get-art`, `sync-song`) because configured sources are exposed through FeedBack's native library provider coordinator. Connection management stays on the plugin's existing screen and backend routes; those UI actions are not declared as a separate capability domain.
+
+## Source types
+
+Every source implements the same FeedBack library-provider interface; the types differ only in how they reach the remote library and how much metadata it exposes. The plugin picks a type from the URL you add — no extra choice to make.
+
+### Remote Library Server (`slopsmith-direct-library.v1`)
+
+The original type. A [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server) exposes a rich REST protocol — server-side search and pagination, artist/album grouping, artwork, tunings, and optional NAM-tone sync. Add its base URL (see [Usage](#usage)).
+
+### Public Google Drive folder (`google-drive-public.v1`)
+
+A public ("anyone with the link", no login) Google Drive **folder** of package files. Paste the folder share link — e.g. `https://drive.google.com/drive/folders/<id>` — and the client:
+
+- **enumerates** the folder and lists its `.feedpak` (or legacy `.sloppak`) files;
+- **derives metadata from the filenames.** Community folders follow an `Artist - Album - Title.feedpak` convention, so artist / album / title come from the name — there is no server API, artwork, tuning, or NAM-tone data to read;
+- **downloads** a song into your local library on demand when you play it.
+
+No Google login and no API key are required: enumeration and download run on the same stdlib HTTP stack (redirect-SSRF guard + size caps) as every other request, with no third-party dependency. Notes and limits:
+
+- The folder must be shared as **"anyone with the link."**
+- Metadata quality depends on the filename convention; oddly-named files still appear, just with a best-effort artist/title.
+- Google temporarily **rate-limits a very popular file** (roughly 24 hours) when many people download it; the client surfaces a clear "try again later" message rather than a cryptic failure.
 
 ## Flow
 

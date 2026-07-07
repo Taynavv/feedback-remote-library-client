@@ -199,7 +199,7 @@
         const node = document.getElementById('remote-library-client-sources');
         if (!node) return;
         if (!state.sources.length) {
-            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No remote sources yet. Click + to add a Remote Library Server URL.</div>';
+            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No remote sources yet. Click + to add a Remote Library Server URL or a public Google Drive folder link.</div>';
             return;
         }
         node.innerHTML = state.sources.map(source => {
@@ -210,6 +210,7 @@
             const enabled = source.enabled !== false;
             const syncNamToneAssets = Boolean(source.syncNamToneAssets);
             const allowUnsafeRedirects = Boolean(source.allowUnsafeRedirects);
+            const isGoogleDrive = (source.type || '') === 'google-drive-public.v1';
             const toggleLabel = busyMode === 'toggle'
                 ? 'Saving source state'
                 : enabled ? 'Disable source' : 'Enable source';
@@ -243,22 +244,23 @@
                         <div class="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-400">
                             <span class="rounded-full border ${status.classes} px-2 py-0.5" title="${esc(status.title)}" aria-label="${esc(status.title)}">${esc(status.label)}</span>
                             <span>${esc(source.songCount || 0)} songs</span>
+                            ${isGoogleDrive ? '<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-sky-300">Google Drive</span>' : ''}
                             ${source.namToneSyncAvailable ? '<span class="rounded-full border border-gray-700 bg-dark-800 px-2 py-0.5 text-gray-300">NAM tones available</span>' : ''}
                             ${source.authRequired && !source.hasToken ? '<span class="rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-red-300">Token required</span>' : (source.hasToken ? '<span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-amber-300">Token set</span>' : '')}
                         </div>
-                        <label class="mt-3 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(namToneLabel)}">
+                        ${isGoogleDrive ? '' : `<label class="mt-3 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(namToneLabel)}">
                             <input type="checkbox" class="h-4 w-4 rounded border-gray-700 bg-dark-800" data-rlc-sync-nam-source="${esc(source.providerId)}" ${syncNamToneAssets ? 'checked' : ''} ${busy ? 'disabled' : ''} />
                             <span class="inline-flex items-center gap-1">${toneIcon()} NAM tones</span>
                         </label>
                         <label class="mt-2 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(allowRedirectsLabel)}">
                             <input type="checkbox" class="h-4 w-4 rounded border-gray-700 bg-dark-800" data-rlc-allow-redirects="${esc(source.providerId)}" ${allowUnsafeRedirects ? 'checked' : ''} ${busy ? 'disabled' : ''} />
                             <span class="inline-flex items-center gap-1">${shieldIcon()} Allow unsafe redirects</span>
-                        </label>
+                        </label>`}
                         ${offline ? `<div class='mt-2 text-xs text-red-300'>This source appears to be offline.${source.message ? ' ' + esc(source.message) : ''}</div>` : (enabled && !source.checkingStatus && source.message ? `<div class="mt-1 text-xs text-amber-300">${esc(source.message)}</div>` : '')}
                     </div>
                     <div class="flex flex-shrink-0 flex-wrap gap-2">
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg ${enabled ? 'bg-green-900/40 text-green-200 hover:bg-green-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-toggle-source="${esc(source.providerId)}" data-rlc-enabled="${enabled ? 'true' : 'false'}" aria-label="${esc(toggleLabel)}" title="${esc(toggleLabel)}" aria-pressed="${enabled ? 'true' : 'false'}" ${busy ? 'disabled' : ''}>${powerIcon(enabled)}</button>
-                        <button class="flex h-10 w-10 items-center justify-center rounded-lg ${source.hasToken ? 'bg-amber-900/40 text-amber-200 hover:bg-amber-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-token="${esc(source.providerId)}" data-rlc-has-token="${source.hasToken ? 'true' : 'false'}" aria-label="${esc(tokenLabel)}" title="${esc(tokenLabel)}" ${busy ? 'disabled' : ''}>${keyIcon()}</button>
+                        ${isGoogleDrive ? '' : `<button class="flex h-10 w-10 items-center justify-center rounded-lg ${source.hasToken ? 'bg-amber-900/40 text-amber-200 hover:bg-amber-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-token="${esc(source.providerId)}" data-rlc-has-token="${source.hasToken ? 'true' : 'false'}" aria-label="${esc(tokenLabel)}" title="${esc(tokenLabel)}" ${busy ? 'disabled' : ''}>${keyIcon()}</button>`}
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-dark-500 hover:text-white ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-refresh-source="${esc(source.providerId)}" aria-label="${esc(refreshLabel)}" title="${esc(refreshLabel)}" ${busy ? 'disabled' : ''}>${refreshIcon(busyMode === 'refresh')}</button>
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-red-900/50 hover:text-red-300 ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-remove="${esc(source.providerId)}" aria-label="${esc(removeLabel)}" title="${esc(removeLabel)}" ${busy ? 'disabled' : ''}>${removeIcon()}</button>
                     </div>
