@@ -10,7 +10,7 @@ Remote Library Client connects [FeedBack](https://github.com/got-feedback/feedBa
 > A Remote Library Server — or a Google Drive folder — you connect to fully controls the metadata and,
 > above all, the **package files** this client downloads into your local library and then plays.
 > **Only connect to sources run by people you trust.** Don't add a URL a stranger handed you, and
-> don't download or play content you can't identify. A malicious or compromised server can serve
+> don't download or play content you can't identify. A malicious or compromised source can hand
 > you a hostile file. If you connect to someone sketchy and it costs you — a trojan, junk data,
 > whatever — **that is on you, not on this project.** There is no warranty; you use it at your own risk.
 
@@ -46,6 +46,8 @@ Notes and limits:
 
 ## Flow
 
+The **Remote Library Server** type speaks this REST protocol. (The **Google Drive** type has no server — it enumerates a public folder and downloads packages directly; see [Source types](#source-types).)
+
 ```mermaid
 flowchart LR
   UI[FeedBack Library] --> Provider[Remote Library Client provider]
@@ -65,15 +67,20 @@ flowchart LR
 
 ## Usage
 
-1. Install the [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server) plugin on the machine that owns the library.
-2. Start that server on its own port.
-3. Install this client plugin on the browsing machine.
-4. Open **Remote Client** and add the server base URL, such as `studio.local`, `http://127.0.0.1:8765`, or `http://192.168.1.X:8765`. If you omit the scheme, the client tries `http` and then `https` on port `8765`. If you give a scheme but no port, it tries the URL as written and then falls back to the same scheme on port `8765`.
-5. Open the main Library screen and choose the remote source from the source selector.
-6. Optional: enable **NAM tones** for the source to sync mapped NAM presets, `.nam` models, and IR `.wav` files when songs are downloaded.
-7. Click a remote song to load it into the local library cache and play it.
+1. Install this client plugin in FeedBack.
+2. Open **Remote Client**, click **+**, and choose a **Source type**:
+   - **Google Drive** — paste a public ("anyone with the link") folder link. No server, login, or token required.
+   - **Remote Library Server** — enter the server's base URL (plus an access token if it requires one); see [Adding a Remote Library Server](#adding-a-remote-library-server).
+3. Add a label if you like, click **Add**, then open the main **Library** screen and pick your source from the source selector.
+4. Click a song to load it into your local library and play it. A song from a Google Drive folder downloads in the background the first time you play it (see [Source types](#source-types)); a Remote Library Server song loads straight from the server.
 
-NAM tone sync is best-effort and non-fatal. If the remote server does not share tone assets, or a tone asset fails to download, the song package still syncs normally and the sync result includes a `toneSync` status object.
+### Adding a Remote Library Server
+
+1. Install the [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server) plugin on the machine that owns the library, and start it on its own port.
+2. In **Remote Client → + → Remote Library Server**, enter its base URL — e.g. `studio.local`, `http://127.0.0.1:8765`, or `http://192.168.1.X:8765`. If you omit the scheme, the client tries `http` then `https` on port `8765`; if you give a scheme but no port, it tries the URL as written then falls back to the same scheme on port `8765`.
+3. Optional: enable **NAM tones** on the source to sync mapped NAM presets, `.nam` models, and IR `.wav` files when songs download.
+
+NAM tone sync is best-effort and non-fatal: if the server doesn't share tone assets, or one fails to download, the song package still syncs normally and the result carries a `toneSync` status object. (NAM tones are a Remote Library Server feature — Google Drive folders don't provide them.)
 
 ## Authentication & security
 
