@@ -24,7 +24,15 @@ import hashlib
 import hmac
 import os
 
-import bcrypt
+
+def _bcrypt():
+    """Import bcrypt lazily so this module — and, transitively, the whole plugin (routes ->
+    proton_drive -> proton_srp) — loads without it. bcrypt is a Proton-only runtime dependency
+    (see requirements.txt); the Remote Library Server and Google Drive types must not need it."""
+    import bcrypt
+
+    return bcrypt
+
 
 # bcrypt's non-standard base64 alphabet (``./`` lead) vs. RFC 4648's (``+/`` tail).
 _STD_B64 = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -63,7 +71,7 @@ def _hash_password(password: bytes, salt: bytes, modulus: bytes) -> bytes:
     ``proton`` and bcrypt-b64 encoded), then expand-hash the crypt string with the modulus."""
     salt = (salt + b"proton")[:16]
     encoded_salt = _bcrypt_b64(salt)[:22]
-    hashed = bcrypt.hashpw(password, b"$2y$10$" + encoded_salt)
+    hashed = _bcrypt().hashpw(password, b"$2y$10$" + encoded_salt)
     return _pm_digest(hashed + modulus)
 
 
@@ -90,7 +98,7 @@ def compute_key_password(url_password: str, share_password_salt: bytes) -> str:
     from the SRP handshake's ``UrlPasswordSalt`` (access) handled in :func:`_hash_password`.
     """
     encoded_salt = _bcrypt_b64(share_password_salt)[:22]
-    return bcrypt.hashpw(url_password.encode(), b"$2y$10$" + encoded_salt)[29:].decode()
+    return _bcrypt().hashpw(url_password.encode(), b"$2y$10$" + encoded_salt)[29:].decode()
 
 
 class SRPUser:
