@@ -82,6 +82,20 @@ def test_download_label_decodes_song_id(tmp_path):
     assert provider._download_label(song_id) == "My Song"
 
 
+def test_addr_for_accepts_bare_endpoint_id():
+    """Regression: a bare EndpointId (the *stable* Library ID) must build a valid EndpointAddr so it
+    can be dialed via discovery. The old code called ``EndpointAddr(id)`` and raised TypeError, so
+    only the volatile full ticket worked — which is why the shared ID appeared to keep changing."""
+    pytest.importorskip("iroh")
+    from remote_library_client.iroh_transport import _get_runtime
+
+    runtime = _get_runtime()
+    bare_id = runtime._endpoint.id().to_bytes().hex()  # a real, valid 64-hex EndpointId
+    assert len(bare_id) == 64
+    addr = runtime._addr_for(bare_id)  # must not raise
+    assert addr is not None
+
+
 # ---------------------------------------------- non-blocking sync (no iroh; download mocked)
 
 

@@ -349,8 +349,12 @@ def _iroh_source(seed: dict) -> dict:
         "token": token,
     }
     payload = _provider_for_source(source)._json("/source", timeout=30)
-    label = str(seed.get("label") or "").strip()
     capabilities = set(payload.get("capabilities") or [])
+    # Validate the handshake: any live iroh endpoint on this ALPN answers, so make sure it's actually
+    # a Remote Library Server (not, say, a leftover test peer) — otherwise it silently browses empty.
+    if "library.read" not in capabilities and not (payload.get("server") or {}).get("protocol"):
+        raise ValueError("This iroh endpoint is not a Remote Library Server.")
+    label = str(seed.get("label") or "").strip()
     source.update({
         "sourceId": str(payload.get("sourceId") or ""),
         "sourceName": str(payload.get("sourceName") or label or "iroh library"),

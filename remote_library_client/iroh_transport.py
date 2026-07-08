@@ -96,8 +96,10 @@ class _IrohRuntime:
         value = normalize_iroh_id(iroh_id)
         if value.lower().startswith("endpoint"):
             return iroh.EndpointTicket.from_string(value).endpoint_addr()
-        # A bare EndpointId relies on iroh discovery to resolve the current address/relay.
-        return iroh.EndpointAddr(iroh.EndpointId.from_string(value))
+        # A bare EndpointId (the stable Library ID) carries no address: pass an empty relay/address
+        # set and let iroh discovery resolve the server's *current* location from the id. (Omitting
+        # the relay_url + addresses args entirely is a TypeError — they are required.)
+        return iroh.EndpointAddr(iroh.EndpointId.from_string(value), None, [])
 
     def _connection(self, iroh_id: str, timeout: float):
         with self._lock:

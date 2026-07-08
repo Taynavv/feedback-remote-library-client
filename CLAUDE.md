@@ -143,9 +143,19 @@ end-to-end-encrypted Proton Drive public share of package files.
   so every endpoint and the bearer token ride along unchanged; the server side (separate repo) just
   pipes each accepted stream to its own local HTTP server. `iroh` runs as one shared background asyncio
   runtime (endpoint + per-Library-ID connection cache) bridged to the sync provider via
-  `run_coroutine_threadsafe`. The Library ID is the paste-able identity (a bare pubkey or a
-  self-contained ticket) and is NOT secret; the per-source `token` still is (stripped by
-  `_public_source`).
+  `run_coroutine_threadsafe`. The Library ID is the paste-able identity and is NOT secret; the
+  per-source `token` still is (stripped by `_public_source`).
+- **The Library ID is the *stable* bare EndpointId — a ticket is the volatile fallback.** `_addr_for`
+  accepts both: a bare EndpointId (64-hex pubkey) → `iroh.EndpointAddr(EndpointId.from_string(id),
+  None, [])`, letting **discovery** resolve the server's current address; or a full `endpoint…` ticket
+  (id + embedded relay/socket addresses). Prefer the bare id — a ticket's string changes every restart
+  as addresses change, so it's a poor thing to "follow." **The `EndpointAddr(id, None, [])` args are
+  required** — `EndpointAddr(id)` raises `TypeError` (the original bug that made only tickets work, so
+  the ID looked non-stable). The server now advertises the bare EndpointId as its Library ID.
+- **`add_source` validates the iroh handshake.** After the `/source` probe, `_iroh_source` requires an
+  RLS marker (`capabilities` has `library.read`, or `server.protocol` is set) — otherwise it errors
+  instead of registering. Any live peer on the `feedback/rls/1` ALPN answers a connect, so a wrong id
+  (e.g. a stray test peer) would otherwise register and silently browse empty.
 - **The iroh sync is non-blocking (same ~250 ms core cap).** `DirectLibraryProvider.sync_song`
   downloads inline — fine on LAN, but an internet iroh hop exceeds core's sync-song cap. So
   `IrohLibraryProvider` overrides `sync_song` to background the download (`_background_sync` calls the
