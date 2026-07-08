@@ -3,10 +3,11 @@
 Remote Library Client is a [FeedBack](https://github.com/got-feedback/feedBack)
 plugin (id `remote_library_client`) that registers remote libraries as native FeedBack
 **library providers**, so a remote library shows up in the core Library source selector
-and its songs can be browsed, synced, and played locally. Three source **types** are
+and its songs can be browsed, synced, and played locally. Four source **types** are
 supported: a [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server)
-URL (the rich REST protocol), a public Google Drive folder of package files, and an
-anonymous end-to-end-encrypted Proton Drive public share of package files.
+URL (the rich REST protocol), the **same server reached peer-to-peer over iroh** by a Library ID
+(no port forwarding), a public Google Drive folder of package files, and an anonymous
+end-to-end-encrypted Proton Drive public share of package files.
 
 ## Architecture
 
@@ -17,8 +18,9 @@ anonymous end-to-end-encrypted Proton Drive public share of package files.
 | [remote_library_client/google_drive.py](remote_library_client/google_drive.py) | `GoogleDrivePublicFolderProvider` — the `google-drive-public.v1` type: enumerate a public Drive folder, parse `Artist - Album - Title.feedpak` filenames for metadata, download packages (redirect + confirm-token flow) into the local cache |
 | [remote_library_client/proton_drive.py](remote_library_client/proton_drive.py) | `ProtonPublicShareProvider` — the `proton-public.v1` type: anonymous SRP auth to a Proton public share, decrypt the OpenPGP key hierarchy + folder listing (`pysequoia`), parse `Artist-Title.feedpak` filenames, download + decrypt content blocks into the local cache. Needs `bcrypt` + `pysequoia` (see `requirements.txt`) |
 | [remote_library_client/proton_srp.py](remote_library_client/proton_srp.py) | Dependency-light reimplementation of Proton's SRP-6a handshake + bcrypt key-stretch, so the plugin needs only `bcrypt` (not the full `proton-client`, which drags in gpg/openssl/requests). Cross-checked against `proton-client` in tests |
+| [remote_library_client/iroh_transport.py](remote_library_client/iroh_transport.py) | `IrohLibraryProvider` — the `iroh-library.v1` type: the **same Remote Library Server protocol tunnelled over an iroh P2P QUIC stream**, reached by a pasted Library ID (EndpointId). Subclasses `DirectLibraryProvider` and overrides only `_urlopen` (HTTP-over-iroh via a socket adapter + a shared background asyncio runtime); adds a non-blocking background sync. Needs `iroh` (see `requirements.txt`, lazy-imported) |
 | [remote_library_client/store.py](remote_library_client/store.py) | Persisted list of configured sources + per-source options (including `type`) |
-| [screen.html](screen.html) / [screen.js](screen.js) | Remote Client screen: add a server URL, Drive folder link, or Proton share link, per-source NAM-tone toggle, status; Google Drive + Proton sources hide the token/NAM/redirect controls (only the direct server shows them) |
+| [screen.html](screen.html) / [screen.js](screen.js) | Remote Client screen: add a server URL, iroh Library ID, Drive folder link, or Proton share link, per-source NAM-tone toggle, status; Google Drive + Proton sources hide the token/NAM/redirect controls (the direct server shows all; the iroh type shows token + NAM but not redirect) |
 | [settings.html](settings.html) | Settings surface |
 | [tests/](tests) | pytest, content-free: fake servers, fake Drive folders, synthetic Proton key hierarchies + synthetic packages |
 
@@ -131,10 +133,25 @@ anonymous end-to-end-encrypted Proton Drive public share of package files.
   as Google (`sync_song` → `active_downloads()` → the screen's `/downloads` poller → toasts; the click
   handler triggers on `proton:` provider ids as well as `gdrive:`). Metadata is filename-derived
   (`parse_proton_filename`: `Artist-Title.feedpak` underscored, or the spaced `Artist - Album - Title`).
-- **Proton is the one type with native deps.** `bcrypt` + `pysequoia` are imported *lazily* (the module
-  loads without them, so its non-crypto tests run dependency-free) and declared in `requirements.txt`.
-  The direct-server and Google Drive types stay dependency-free, so they keep working on a deploy that
-  cannot install the Proton deps.
+- **Native deps are per-type and lazy.** Proton needs `bcrypt` + `pysequoia`; the iroh type needs
+  `iroh`. All are imported *lazily* (the modules — and their non-crypto tests — load without them) and
+  declared in `requirements.txt`. The direct-server and Google Drive types stay dependency-free, so
+  they keep working on a deploy that cannot install the native wheels.
+- **The iroh type tunnels the existing HTTP — the server protocol + auth are untouched.**
+  `iroh-library.v1` subclasses `DirectLibraryProvider` and overrides only `_urlopen`: it opens an iroh
+  `BiStream` to the stored EndpointId and speaks HTTP over it (a socket adapter feeds `http.client`),
+  so every endpoint and the bearer token ride along unchanged; the server side (separate repo) just
+  pipes each accepted stream to its own local HTTP server. `iroh` runs as one shared background asyncio
+  runtime (endpoint + per-Library-ID connection cache) bridged to the sync provider via
+  `run_coroutine_threadsafe`. The Library ID is the paste-able identity (a bare pubkey or a
+  self-contained ticket) and is NOT secret; the per-source `token` still is (stripped by
+  `_public_source`).
+- **The iroh sync is non-blocking (same ~250 ms core cap).** `DirectLibraryProvider.sync_song`
+  downloads inline — fine on LAN, but an internet iroh hop exceeds core's sync-song cap. So
+  `IrohLibraryProvider` overrides `sync_song` to background the download (`_background_sync` calls the
+  direct package-download), return immediately, and play on the next click, exposing
+  `active_downloads()` for the `/downloads` poller (the Google Drive / Proton pattern). The screen's
+  click handler + poller treat `iroh:` provider ids like `gdrive:` / `proton:`.
 
 ## Rules
 

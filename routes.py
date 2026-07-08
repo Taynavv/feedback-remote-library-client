@@ -12,6 +12,11 @@ from remote_library_client.google_drive import (
     is_google_drive_folder_url,
     parse_drive_folder_id,
 )
+from remote_library_client.iroh_transport import (
+    IrohLibraryProvider,
+    is_iroh_id,
+    normalize_iroh_id,
+)
 from remote_library_client.proton_drive import (
     ProtonPublicShareProvider,
     is_proton_share_url,
@@ -45,6 +50,7 @@ PROVIDER_TYPES = {
     DirectLibraryProvider.type: DirectLibraryProvider,
     GoogleDrivePublicFolderProvider.type: GoogleDrivePublicFolderProvider,
     ProtonPublicShareProvider.type: ProtonPublicShareProvider,
+    IrohLibraryProvider.type: IrohLibraryProvider,
 }
 
 
@@ -321,6 +327,57 @@ def _save_checked_proton_source(source: dict) -> dict:
     }
 
 
+def _iroh_source(seed: dict) -> dict:
+    """Build (or refresh) a Remote Server (iroh) source: validate the Library ID, then reach the
+    server *over iroh* and read ``/source`` to validate + capture its metadata. It speaks the exact
+    same protocol as the direct server type (token auth, NAM tones, artwork) — only the transport
+    differs, so almost everything is reused from :class:`DirectLibraryProvider`."""
+    iroh_id = normalize_iroh_id(seed.get("irohId") or seed.get("baseUrl") or "")
+    if not is_iroh_id(iroh_id):
+        raise ValueError("not a valid iroh Library ID")
+    token = str(seed.get("token") or "").strip()
+    source = {
+        **seed,
+        "type": IrohLibraryProvider.type,
+        "irohId": iroh_id,
+        "baseUrl": f"iroh://{iroh_id[:16]}…",  # display-only; the real identity is irohId
+        "providerId": seed.get("providerId")
+        or provider_id_for_source(f"iroh_{iroh_id[:24]}", iroh_id, prefix="iroh"),
+        "enabled": _source_enabled(seed),
+        "syncNamToneAssets": bool(seed.get("syncNamToneAssets")),
+        "allowUnsafeRedirects": False,
+        "token": token,
+    }
+    payload = _provider_for_source(source)._json("/source", timeout=30)
+    label = str(seed.get("label") or "").strip()
+    capabilities = set(payload.get("capabilities") or [])
+    source.update({
+        "sourceId": str(payload.get("sourceId") or ""),
+        "sourceName": str(payload.get("sourceName") or label or "iroh library"),
+        "label": label or seed.get("label") or payload.get("sourceName") or "iroh library",
+        "protocol": IrohLibraryProvider.type,
+        "songCount": _safe_int(payload.get("songCount"), 0),
+        "remoteCapabilities": list(payload.get("capabilities") or []),
+        "namToneSyncAvailable": bool((payload.get("namToneSync") or {}).get("enabled"))
+        or "nam-tone-sync.read" in capabilities,
+        "authRequired": bool((payload.get("auth") or {}).get("required")),
+        "lastSuccessfulContactAt": _utc_now_iso(),
+    })
+    return source
+
+
+def _save_checked_iroh_source(source: dict) -> dict:
+    updated = _iroh_source(source)
+    provider = _register_source_provider(updated, replace=True)
+    _store.upsert_source(updated)
+    return {
+        **updated,
+        "registered": bool(provider and provider.id in _providers),
+        "online": True,
+        "message": "",
+    }
+
+
 def _provider_payload(provider: BaseLibraryProvider | None) -> dict | None:
     if not provider:
         return None
@@ -403,6 +460,18 @@ def setup(app, context):
                     item["message"] = _public_error_message(exc)
                 sources.append(_public_source(item))
                 continue
+            if _source_type(source) == IrohLibraryProvider.type:
+                try:
+                    item.update(_save_checked_iroh_source(source))
+                except AuthRequiredError:
+                    item["authRequired"] = True
+                    item["message"] = (
+                        "Access token rejected" if str(source.get("token") or "").strip() else "Access token required"
+                    )
+                except Exception as exc:
+                    item["message"] = _public_error_message(exc)
+                sources.append(_public_source(item))
+                continue
             try:
                 payload = _probe_source(source.get("baseUrl") or "", source.get("token") or "")
                 item.update(_save_checked_source(source, payload))
@@ -452,6 +521,24 @@ def setup(app, context):
                 return {"ok": True, "source": _public_source(source), "provider": _provider_payload(provider)}
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
+        use_iroh = source_type == IrohLibraryProvider.type or (not source_type and is_iroh_id(raw_url))
+        if use_iroh:
+            token = str(data.get("token") or "").strip()
+            try:
+                source = _iroh_source({
+                    "irohId": raw_url,
+                    "label": str(data.get("label") or "").strip(),
+                    "syncNamToneAssets": bool(data.get("syncNamToneAssets")),
+                    "token": token,
+                })
+                provider = _register_source_provider(source, replace=True)
+                _store.upsert_source(source)
+                return {"ok": True, "source": _public_source(source), "provider": _provider_payload(provider)}
+            except AuthRequiredError as exc:
+                message = "The access token was rejected." if token else "This server requires an access token."
+                raise HTTPException(status_code=401, detail=message) from exc
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
         token = str(data.get("token") or "").strip()
         try:
             base_url, payload = _probe_first_available(raw_url, token)
@@ -491,6 +578,16 @@ def setup(app, context):
                 updated = _save_checked_proton_source(source)
                 provider = _providers.get(updated.get("providerId") or "")
                 return {"ok": True, "source": _public_source(updated), "provider": _provider_payload(provider)}
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
+        if _source_type(source) == IrohLibraryProvider.type:
+            try:
+                updated = _save_checked_iroh_source(source)
+                provider = _providers.get(updated.get("providerId") or "")
+                return {"ok": True, "source": _public_source(updated), "provider": _provider_payload(provider)}
+            except AuthRequiredError as exc:
+                message = "Access token rejected" if str(source.get("token") or "").strip() else "Access token required"
+                raise HTTPException(status_code=401, detail=message) from exc
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
         try:

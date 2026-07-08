@@ -54,17 +54,21 @@
         const type = selectedSourceType();
         const isDirect = type === 'slopsmith-direct-library.v1';
         const isProton = type === 'proton-public.v1';
+        const isIroh = type === 'iroh-library.v1';
         const tokenRow = document.getElementById('rlc-token-row');
-        if (tokenRow) tokenRow.classList.toggle('hidden', !isDirect);
+        // iroh speaks the same protocol as the direct server, so it uses the same optional token.
+        if (tokenRow) tokenRow.classList.toggle('hidden', !(isDirect || isIroh));
         const urlLabel = document.getElementById('rlc-base-url-label');
-        if (urlLabel) urlLabel.textContent = isDirect ? 'Server URL' : isProton ? 'Proton share link' : 'Google Drive folder link';
+        if (urlLabel) urlLabel.textContent = isDirect ? 'Server URL' : isProton ? 'Proton share link' : isIroh ? 'Library ID' : 'Google Drive folder link';
         const urlInput = document.getElementById('rlc-base-url');
         if (urlInput) {
             urlInput.placeholder = isDirect
                 ? 'studio.local or http://192.168.1.x:8765'
                 : isProton
                     ? 'https://drive.proton.me/urls/…#…'
-                    : 'https://drive.google.com/drive/folders/…';
+                    : isIroh
+                        ? "the server's Library ID (endpoint…)"
+                        : 'https://drive.google.com/drive/folders/…';
         }
     }
 
@@ -298,7 +302,7 @@
         const node = document.getElementById('remote-library-client-sources');
         if (!node) return;
         if (!state.sources.length) {
-            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No remote sources yet. Click + to add a public Google Drive folder, a Proton Drive share link, or a Remote Library Server URL.</div>';
+            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No remote sources yet. Click + to add a public Google Drive folder, a Proton Drive share link, or a Remote Library Server (by URL, or over iroh by its Library ID).</div>';
             return;
         }
         node.innerHTML = state.sources.map(source => {
@@ -311,11 +315,14 @@
             const allowUnsafeRedirects = Boolean(source.allowUnsafeRedirects);
             const sourceType = source.type || 'slopsmith-direct-library.v1';
             const isDirect = sourceType === 'slopsmith-direct-library.v1';
+            const isIroh = sourceType === 'iroh-library.v1';
             const typeBadge = sourceType === 'google-drive-public.v1'
                 ? '<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-sky-300">Google Drive</span>'
                 : sourceType === 'proton-public.v1'
                     ? '<span class="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-violet-300">Proton Drive</span>'
-                    : '';
+                    : isIroh
+                        ? '<span class="rounded-full border border-teal-500/30 bg-teal-500/10 px-2 py-0.5 text-teal-300">iroh · P2P</span>'
+                        : '';
             const toggleLabel = busyMode === 'toggle'
                 ? 'Saving source state'
                 : enabled ? 'Disable source' : 'Enable source';
@@ -353,11 +360,11 @@
                             ${source.namToneSyncAvailable ? '<span class="rounded-full border border-gray-700 bg-dark-800 px-2 py-0.5 text-gray-300">NAM tones available</span>' : ''}
                             ${source.authRequired && !source.hasToken ? '<span class="rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-red-300">Token required</span>' : (source.hasToken ? '<span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-amber-300">Token set</span>' : '')}
                         </div>
-                        ${isDirect ? `<label class="mt-3 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(namToneLabel)}">
+                        ${(isDirect || isIroh) ? `<label class="mt-3 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(namToneLabel)}">
                             <input type="checkbox" class="h-4 w-4 rounded border-gray-700 bg-dark-800" data-rlc-sync-nam-source="${esc(source.providerId)}" ${syncNamToneAssets ? 'checked' : ''} ${busy ? 'disabled' : ''} />
                             <span class="inline-flex items-center gap-1">${toneIcon()} NAM tones</span>
-                        </label>
-                        <label class="mt-2 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(allowRedirectsLabel)}">
+                        </label>` : ''}
+                        ${isDirect ? `<label class="mt-2 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(allowRedirectsLabel)}">
                             <input type="checkbox" class="h-4 w-4 rounded border-gray-700 bg-dark-800" data-rlc-allow-redirects="${esc(source.providerId)}" ${allowUnsafeRedirects ? 'checked' : ''} ${busy ? 'disabled' : ''} />
                             <span class="inline-flex items-center gap-1">${shieldIcon()} Allow unsafe redirects</span>
                         </label>` : ''}
@@ -365,7 +372,7 @@
                     </div>
                     <div class="flex flex-shrink-0 flex-wrap gap-2">
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg ${enabled ? 'bg-green-900/40 text-green-200 hover:bg-green-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-toggle-source="${esc(source.providerId)}" data-rlc-enabled="${enabled ? 'true' : 'false'}" aria-label="${esc(toggleLabel)}" title="${esc(toggleLabel)}" aria-pressed="${enabled ? 'true' : 'false'}" ${busy ? 'disabled' : ''}>${powerIcon(enabled)}</button>
-                        ${isDirect ? `<button class="flex h-10 w-10 items-center justify-center rounded-lg ${source.hasToken ? 'bg-amber-900/40 text-amber-200 hover:bg-amber-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-token="${esc(source.providerId)}" data-rlc-has-token="${source.hasToken ? 'true' : 'false'}" aria-label="${esc(tokenLabel)}" title="${esc(tokenLabel)}" ${busy ? 'disabled' : ''}>${keyIcon()}</button>` : ''}
+                        ${(isDirect || isIroh) ? `<button class="flex h-10 w-10 items-center justify-center rounded-lg ${source.hasToken ? 'bg-amber-900/40 text-amber-200 hover:bg-amber-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-token="${esc(source.providerId)}" data-rlc-has-token="${source.hasToken ? 'true' : 'false'}" aria-label="${esc(tokenLabel)}" title="${esc(tokenLabel)}" ${busy ? 'disabled' : ''}>${keyIcon()}</button>` : ''}
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-dark-500 hover:text-white ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-refresh-source="${esc(source.providerId)}" aria-label="${esc(refreshLabel)}" title="${esc(refreshLabel)}" ${busy ? 'disabled' : ''}>${refreshIcon(busyMode === 'refresh')}</button>
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-red-900/50 hover:text-red-300 ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-remove="${esc(source.providerId)}" aria-label="${esc(removeLabel)}" title="${esc(removeLabel)}" ${busy ? 'disabled' : ''}>${removeIcon()}</button>
                     </div>
@@ -391,20 +398,23 @@
     async function addSource() {
         const type = selectedSourceType();
         const isDirect = type === 'slopsmith-direct-library.v1';
+        const isIroh = type === 'iroh-library.v1';
         const baseUrl = normalizeBaseUrl(document.getElementById('rlc-base-url')?.value || '');
         const label = document.getElementById('rlc-label')?.value.trim() || '';
-        const token = isDirect ? (document.getElementById('rlc-token')?.value.trim() || '') : '';
+        const token = (isDirect || isIroh) ? (document.getElementById('rlc-token')?.value.trim() || '') : '';
         if (!baseUrl) throw new Error(isDirect
             ? 'Enter a server URL or hostname (for example: studio.local).'
             : type === 'proton-public.v1'
                 ? 'Paste the full Proton share link, including the password after #.'
-                : 'Paste a public Google Drive folder link.');
+                : isIroh
+                    ? "Paste the server's Library ID (from its “Share over iroh” panel)."
+                    : 'Paste a public Google Drive folder link.');
         if (state.adding) return;
         setBusyState({ adding: true });
         setMessage('Adding source...', 'neutral');
         try {
             const body = { type, baseUrl, label };
-            if (isDirect && token) body.token = token;
+            if ((isDirect || isIroh) && token) body.token = token;
             let result;
             try {
                 result = await api('/sources', { method: 'POST', body: JSON.stringify(body) });
@@ -648,7 +658,8 @@
             let providerId = '';
             try { providerId = decodeURIComponent(card.getAttribute('data-library-provider') || ''); } catch (error) { return; }
             const isProton = providerId.startsWith('proton:');
-            if (!providerId.startsWith('gdrive:') && !isProton) return;
+            const isIroh = providerId.startsWith('iroh:');
+            if (!providerId.startsWith('gdrive:') && !isProton && !isIroh) return;
             let songId = '';
             try { songId = decodeURIComponent(card.getAttribute('data-library-song') || ''); } catch (error) { songId = ''; }
             // Instant "downloading" toast — the v3 song page has no per-card sync badge, so a
@@ -657,7 +668,7 @@
             const key = `${providerId} ${songId}`;
             if (songId && state.downloadSeen[key] !== 'downloading') {
                 state.downloadSeen[key] = 'downloading';
-                notifyDownloading(isProton ? 'Proton Drive' : 'Google Drive');
+                notifyDownloading(isProton ? 'Proton Drive' : isIroh ? 'the iroh server' : 'Google Drive');
             }
             ensureDownloadPolling();
         });

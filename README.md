@@ -1,8 +1,9 @@
 # Remote Library Client
 
-Remote Library Client connects [FeedBack](https://github.com/got-feedback/feedBack) to one or more remote libraries. Each configured source is registered as a FeedBack library provider, so it appears in the core Library source selector. Three source types are supported:
+Remote Library Client connects [FeedBack](https://github.com/got-feedback/feedBack) to one or more remote libraries. Each configured source is registered as a FeedBack library provider, so it appears in the core Library source selector. Four source types are supported:
 
 - **Remote Library Server** — a [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server) URL speaking the full metadata/search/artwork/NAM-tone protocol.
+- **Remote Server over iroh** — the *same* Remote Library Server, reached **peer-to-peer by a Library ID** with no port forwarding. Paste the ID the server shows and its songs appear in FeedBack. See [Source types](#source-types).
 - **Public Google Drive folder** — a public ("anyone with the link") Google Drive folder of package files; paste the folder link and its songs show up in FeedBack. See [Source types](#source-types).
 - **Public Proton Drive share** — an anonymous, end-to-end-encrypted Proton Drive share of package files; paste the share link (with its password) and its songs show up in FeedBack. See [Source types](#source-types).
 
@@ -27,6 +28,15 @@ Every source implements the same FeedBack library-provider interface; the types 
 ### Remote Library Server (`slopsmith-direct-library.v1`)
 
 The original type. A [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server) exposes a rich REST protocol — server-side search and pagination, artist/album grouping, artwork, tunings, and optional NAM-tone sync. Add its base URL (see [Usage](#usage)).
+
+### Remote Server over iroh (`iroh-library.v1`)
+
+The **same Remote Library Server, reached peer-to-peer by ID** — no port forwarding, no dynamic-DNS, no exposing your machine. The server enables **Share over iroh** and shows a **Library ID**; you paste that ID here and everything else — browsing, search, artwork, tunings, NAM-tone sync, the optional access token — works exactly as the direct type, because it's the identical protocol tunnelled over an [iroh](https://www.iroh.computer/) QUIC connection. iroh dials outbound to a relay/discovery network, so the server is reachable from anywhere the moment it's online.
+
+- **Identity is a public key.** The Library ID is self-authenticating: connecting to it is cryptographically guaranteed to be that server — no impersonation, stronger than a plain URL. Set an access token on the server unless you're fine with anyone who has the ID browsing.
+- **Availability = the server is online.** Unlike the cloud-hosted types, this follows a *live* server: when its machine is off, the library is off.
+- **Songs download in the background** the first time you play them (an internet hop can't meet FeedBack's instant-sync budget), then play on the next click — same as the Google Drive / Proton types.
+- Requires the `iroh` dependency (see below); the connection may fall back to a shared relay for hard NATs, which is slower than a direct hole-punched path.
 
 ### Public Google Drive folder (`google-drive-public.v1`)
 
@@ -91,6 +101,7 @@ flowchart LR
 2. Open **Remote Client**, click **+**, and choose a **Source type**:
    - **Google Drive** — paste a public ("anyone with the link") folder link. No server, login, or token required.
    - **Proton Drive** — paste a public share link *including its `#…` password*. No Proton account or login required.
+   - **Remote Server over iroh** — paste the **Library ID** the server shows under its “Share over iroh” panel (plus an access token if it set one). No URL, no port forwarding.
    - **Remote Library Server** — enter the server's base URL (plus an access token if it requires one); see [Adding a Remote Library Server](#adding-a-remote-library-server).
 3. Add a label if you like, click **Add**, then open the main **Library** screen and pick your source from the source selector.
 4. Click a song to load it into your local library and play it. A song from a Google Drive folder or a Proton Drive share downloads (and, for Proton, decrypts) in the background the first time you play it (see [Source types](#source-types)); a Remote Library Server song loads straight from the server.

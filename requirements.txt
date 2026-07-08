@@ -1,14 +1,14 @@
-# Runtime dependencies for the Proton Drive public-share provider (proton-public.v1).
+# Runtime dependencies for the optional source types. FeedBack installs these into the plugin's
+# persistent pip_packages directory on load (the same mechanism feedback-ultrastar-import uses for
+# numpy). Every one is imported LAZILY and only when its source type is actually used, so the core
+# plugin and the dependency-free types (Remote Library Server, Google Drive) still run on a deploy
+# that cannot install these. All ship prebuilt wheels for Python 3.12 (FeedBack's interpreter).
 #
-# FeedBack installs these into the plugin's persistent pip_packages directory on load (the same
-# mechanism feedback-ultrastar-import uses for numpy). Both ship prebuilt wheels for Python 3.12,
-# FeedBack's bundled interpreter. Only the Proton source type imports them — the Remote Library
-# Server and Google Drive types remain dependency-free, so a deploy that cannot install these
-# still runs those types.
-#
-#   bcrypt     — the SRP password key-stretch for anonymous public-share auth (proton_srp.py)
-#   pysequoia  — OpenPGP decryption of the E2EE key hierarchy + content blocks (proton_drive.py).
-#                A native (Rust) wheel; it handles both SEIPD versions, unlike the unmaintained
-#                pure-Python PGPy (which also fails to import on Python 3.13+).
+#   bcrypt / pysequoia  — Proton Drive public shares (proton-public.v1): the SRP password
+#                         key-stretch + OpenPGP decryption of the E2EE key hierarchy + blocks.
+#   iroh                — the Remote Server (iroh) type (iroh-library.v1): a peer-to-peer QUIC
+#                         transport that tunnels the Remote Library Server protocol, so a
+#                         home-hosted server is reachable by its Library ID with no port forwarding.
 bcrypt>=4.0
 pysequoia>=0.1.34,<0.2
+iroh>=1.0,<2

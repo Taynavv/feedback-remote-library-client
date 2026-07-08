@@ -43,7 +43,7 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           NAME="feedback-remote-library-client"
           mkdir -p "dist/$NAME"
-          cp -r plugin.json routes.py screen.html screen.js settings.html assets remote_library_client README.md LICENSE "dist/$NAME/"
+          cp -r plugin.json requirements.txt routes.py screen.html screen.js settings.html assets remote_library_client README.md LICENSE "dist/$NAME/"
           find "dist/$NAME" -name '__pycache__' -type d -prune -exec rm -rf {} +
           # Fail the build if the manifest references a file that did not get packaged
           python - "$NAME" <<'PY'
