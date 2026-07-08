@@ -1,0 +1,14 @@
+# Runtime dependencies for the Proton Drive public-share provider (proton-public.v1).
+#
+# FeedBack installs these into the plugin's persistent pip_packages directory on load (the same
+# mechanism feedback-ultrastar-import uses for numpy). Both ship prebuilt wheels for Python 3.12,
+# FeedBack's bundled interpreter. Only the Proton source type imports them — the Remote Library
+# Server and Google Drive types remain dependency-free, so a deploy that cannot install these
+# still runs those types.
+#
+#   bcrypt     — the SRP password key-stretch for anonymous public-share auth (proton_srp.py)
+#   pysequoia  — OpenPGP decryption of the E2EE key hierarchy + content blocks (proton_drive.py).
+#                A native (Rust) wheel; it handles both SEIPD versions, unlike the unmaintained
+#                pure-Python PGPy (which also fails to import on Python 3.13+).
+bcrypt>=4.0
+pysequoia>=0.1.34,<0.2

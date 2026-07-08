@@ -3,9 +3,10 @@
 Remote Library Client is a [FeedBack](https://github.com/got-feedback/feedBack)
 plugin (id `remote_library_client`) that registers remote libraries as native FeedBack
 **library providers**, so a remote library shows up in the core Library source selector
-and its songs can be browsed, synced, and played locally. Two source **types** are
+and its songs can be browsed, synced, and played locally. Three source **types** are
 supported: a [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server)
-URL (the rich REST protocol) and a public Google Drive folder of package files.
+URL (the rich REST protocol), a public Google Drive folder of package files, and an
+anonymous end-to-end-encrypted Proton Drive public share of package files.
 
 ## Architecture
 
@@ -14,10 +15,12 @@ URL (the rich REST protocol) and a public Google Drive folder of package files.
 | [routes.py](routes.py) | `setup(app, context)`: connection management (add / remove / list sources, health probe), a `PROVIDER_TYPES` registry that dispatches each source on its stored `type` (default = direct server; Google Drive folder URLs auto-detected), and wiring providers into FeedBack's library provider coordinator; resolves the local package cache via the `get_sloppak_cache_dir` context callback |
 | [remote_library_client/provider.py](remote_library_client/provider.py) | `BaseLibraryProvider` (shared transport / cache / library-import machinery + graceful-default `get-art` / `tuning-names`) and `DirectLibraryProvider` — the Remote Library Server implementation (`query-page` / `query-artists` / `query-stats` / `tuning-names` / `get-art` / `sync-song`, package download + NAM-tone asset sync) |
 | [remote_library_client/google_drive.py](remote_library_client/google_drive.py) | `GoogleDrivePublicFolderProvider` — the `google-drive-public.v1` type: enumerate a public Drive folder, parse `Artist - Album - Title.feedpak` filenames for metadata, download packages (redirect + confirm-token flow) into the local cache |
+| [remote_library_client/proton_drive.py](remote_library_client/proton_drive.py) | `ProtonPublicShareProvider` — the `proton-public.v1` type: anonymous SRP auth to a Proton public share, decrypt the OpenPGP key hierarchy + folder listing (`pysequoia`), parse `Artist-Title.feedpak` filenames, download + decrypt content blocks into the local cache. Needs `bcrypt` + `pysequoia` (see `requirements.txt`) |
+| [remote_library_client/proton_srp.py](remote_library_client/proton_srp.py) | Dependency-light reimplementation of Proton's SRP-6a handshake + bcrypt key-stretch, so the plugin needs only `bcrypt` (not the full `proton-client`, which drags in gpg/openssl/requests). Cross-checked against `proton-client` in tests |
 | [remote_library_client/store.py](remote_library_client/store.py) | Persisted list of configured sources + per-source options (including `type`) |
-| [screen.html](screen.html) / [screen.js](screen.js) | Remote Client screen: add a server URL or Drive folder link, per-source NAM-tone toggle, status; Google sources hide the token/NAM/redirect controls |
+| [screen.html](screen.html) / [screen.js](screen.js) | Remote Client screen: add a server URL, Drive folder link, or Proton share link, per-source NAM-tone toggle, status; Google Drive + Proton sources hide the token/NAM/redirect controls (only the direct server shows them) |
 | [settings.html](settings.html) | Settings surface |
-| [tests/](tests) | pytest, content-free: fake servers, fake Drive folders + synthetic packages |
+| [tests/](tests) | pytest, content-free: fake servers, fake Drive folders, synthetic Proton key hierarchies + synthetic packages |
 
 ## Load-bearing subtleties — do not "clean up" casually
 
@@ -93,6 +96,45 @@ URL (the rich REST protocol) and a public Google Drive folder of package files.
   `.sloppak`/`.zip` (feedpak == sloppak internally). Part of the client↔core
   playback-settings-key contract above — validate against FeedBack core if feedpak NAM
   mappings ever fail.
+- **Proton is anonymous SRP + E2EE — the crypto chain is exact, verified live.** `proton-public.v1`
+  authenticates to a public share with an anonymous **SRP-6a** handshake (`GET /drive/urls/{token}/info`
+  → `POST .../auth` → session `{UID, AccessToken, Share}`), then unwinds an OpenPGP key hierarchy:
+  bcrypt-stretch the URL password with **`SharePasswordSalt`** (Proton's `computeKeyPassword`, *not* the
+  SRP's `UrlPasswordSalt`) → symmetric-decrypt `SharePassphrase` → unlock `ShareKey` → decrypt the root
+  link's `NodePassphrase` (from `/folders/{LinkID}` or `/links/{LinkID}`) → unlock the root `NodeKey` →
+  per child: decrypt its `NodePassphrase` with the **parent** node key, unlock the child `NodeKey`, and
+  decrypt its **`Name` with the child's own node key** (fall back to the parent key). These field names
+  and the "name decrypts with the child key" detail are verified against a real share — match them exactly.
+- **Proton content = `ContentKeyPacket` + block, decrypted per block.** A file revision
+  (`GET /drive/urls/{token}/files/{LinkID}?FromBlockIndex&PageSize`) has one base64 `ContentKeyPacket`
+  (a PKESK to the file node key) and N `Blocks` (each a `BareURL` to a raw SEIPD packet). Each block
+  decrypts by concatenating `ContentKeyPacket + block_bytes` into one OpenPGP message and decrypting with
+  the file node key. Reassemble in `Index` order → the `.feedpak`. (This reconstruction is proven in a
+  synthetic-key end-to-end test.)
+- **The Proton URL password is a secret — like the server token.** The `#…` fragment of a share link is
+  the decryption key. It is stored per source as **`urlPassword`** (never placed in the displayable
+  `baseUrl`, which holds only the semi-public token) and **`_public_source` strips it** (alongside the
+  server `token`) from every API response. Keep it out of responses and logs.
+- **`proton_srp.py` is a deliberate reimplementation, not a shortcut.** Depending on `proton-client`
+  drags in `python-gnupg` (needs the `gpg` binary), `pyopenssl`, and `requests`. So the SRP handshake +
+  bcrypt helper are reimplemented against `bcrypt` alone. It reproduces Proton's exact quirks —
+  **little-endian** big-int encoding and an **expanded SHA-512** (`pmhash`, four SHA-512s) — and is
+  cross-checked byte-for-byte against `proton-client` in `test_proton_srp.py` (a test-only `importorskip`,
+  not a runtime dep). Don't "simplify" the endianness or the hash.
+- **Proton providers are reused across status polls — Proton rate-limits auth.** Unlike the Google path
+  (which rebuilds a provider each status refresh), `_save_checked_proton_source` reuses the already-
+  registered provider instance so its cached SRP session + catalog survive; a fresh handshake on every
+  poll would risk Proton's anti-abuse throttle. The provider caches the session (to `ExpiresIn`) and the
+  decrypted catalog (TTL). `x-pm-appversion` (`PROTON_APP_VERSION`) is a required, drifting header —
+  bump it if listing starts failing.
+- **Proton sync is non-blocking too** — same ~250ms core cap and the same background-download machinery
+  as Google (`sync_song` → `active_downloads()` → the screen's `/downloads` poller → toasts; the click
+  handler triggers on `proton:` provider ids as well as `gdrive:`). Metadata is filename-derived
+  (`parse_proton_filename`: `Artist-Title.feedpak` underscored, or the spaced `Artist - Album - Title`).
+- **Proton is the one type with native deps.** `bcrypt` + `pysequoia` are imported *lazily* (the module
+  loads without them, so its non-crypto tests run dependency-free) and declared in `requirements.txt`.
+  The direct-server and Google Drive types stay dependency-free, so they keep working on a deploy that
+  cannot install the Proton deps.
 
 ## Rules
 
@@ -108,6 +150,11 @@ URL (the rich REST protocol) and a public Google Drive folder of package files.
 python -m venv .venv
 # Activate:  Windows: .venv\Scripts\activate  |  macOS/Linux: source .venv/bin/activate
 pip install pytest fastapi httpx ruff
+pip install -r requirements.txt   # bcrypt + pysequoia — required for the Proton crypto tests to run
 ruff check .   # CI gate: E, F, I rules, line-length 120
 pytest -q
 ```
+
+The Proton crypto tests `importorskip` `pysequoia`/`bcrypt`, so the suite still passes without
+them (those tests just skip) — but install `requirements.txt` to actually exercise the Proton
+provider. CI installs it so the full end-to-end crypto test runs.

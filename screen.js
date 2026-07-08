@@ -48,18 +48,23 @@
     }
 
     // Per-type add form: the Access token field only applies to a Remote Library Server, so
-    // hide it (and re-label the URL field) for Google Drive.
+    // hide it (and re-label the URL field) for Google Drive / Proton Drive. Proton's password
+    // travels inside the share link itself (the #fragment), so it needs no separate field.
     function applyTypeUI() {
-        const isDirect = selectedSourceType() === 'slopsmith-direct-library.v1';
+        const type = selectedSourceType();
+        const isDirect = type === 'slopsmith-direct-library.v1';
+        const isProton = type === 'proton-public.v1';
         const tokenRow = document.getElementById('rlc-token-row');
         if (tokenRow) tokenRow.classList.toggle('hidden', !isDirect);
         const urlLabel = document.getElementById('rlc-base-url-label');
-        if (urlLabel) urlLabel.textContent = isDirect ? 'Server URL' : 'Google Drive folder link';
+        if (urlLabel) urlLabel.textContent = isDirect ? 'Server URL' : isProton ? 'Proton share link' : 'Google Drive folder link';
         const urlInput = document.getElementById('rlc-base-url');
         if (urlInput) {
             urlInput.placeholder = isDirect
                 ? 'studio.local or http://192.168.1.x:8765'
-                : 'https://drive.google.com/drive/folders/…';
+                : isProton
+                    ? 'https://drive.proton.me/urls/…#…'
+                    : 'https://drive.google.com/drive/folders/…';
         }
     }
 
@@ -210,9 +215,9 @@
         catch (error) { /* notifications unavailable */ }
     }
 
-    function notifyDownloading() {
+    function notifyDownloading(sourceName) {
         if (!window.fbNotify || typeof window.fbNotify.show !== 'function') return;
-        try { window.fbNotify.show({ title: 'Downloading…', message: 'Fetching from Google Drive…', icon: '⬇️' }); }
+        try { window.fbNotify.show({ title: 'Downloading…', message: sourceName ? `Fetching from ${sourceName}…` : 'Fetching the song…', icon: '⬇️' }); }
         catch (error) { /* notifications unavailable */ }
     }
 
@@ -293,7 +298,7 @@
         const node = document.getElementById('remote-library-client-sources');
         if (!node) return;
         if (!state.sources.length) {
-            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No remote sources yet. Click + to add a Remote Library Server URL or a public Google Drive folder link.</div>';
+            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No remote sources yet. Click + to add a public Google Drive folder, a Proton Drive share link, or a Remote Library Server URL.</div>';
             return;
         }
         node.innerHTML = state.sources.map(source => {
@@ -304,7 +309,13 @@
             const enabled = source.enabled !== false;
             const syncNamToneAssets = Boolean(source.syncNamToneAssets);
             const allowUnsafeRedirects = Boolean(source.allowUnsafeRedirects);
-            const isGoogleDrive = (source.type || '') === 'google-drive-public.v1';
+            const sourceType = source.type || 'slopsmith-direct-library.v1';
+            const isDirect = sourceType === 'slopsmith-direct-library.v1';
+            const typeBadge = sourceType === 'google-drive-public.v1'
+                ? '<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-sky-300">Google Drive</span>'
+                : sourceType === 'proton-public.v1'
+                    ? '<span class="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-violet-300">Proton Drive</span>'
+                    : '';
             const toggleLabel = busyMode === 'toggle'
                 ? 'Saving source state'
                 : enabled ? 'Disable source' : 'Enable source';
@@ -338,23 +349,23 @@
                         <div class="mt-2 flex flex-wrap items-center gap-2 text-xs text-gray-400">
                             <span class="rounded-full border ${status.classes} px-2 py-0.5" title="${esc(status.title)}" aria-label="${esc(status.title)}">${esc(status.label)}</span>
                             <span>${esc(source.songCount || 0)} songs</span>
-                            ${isGoogleDrive ? '<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-sky-300">Google Drive</span>' : ''}
+                            ${typeBadge}
                             ${source.namToneSyncAvailable ? '<span class="rounded-full border border-gray-700 bg-dark-800 px-2 py-0.5 text-gray-300">NAM tones available</span>' : ''}
                             ${source.authRequired && !source.hasToken ? '<span class="rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-red-300">Token required</span>' : (source.hasToken ? '<span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-amber-300">Token set</span>' : '')}
                         </div>
-                        ${isGoogleDrive ? '' : `<label class="mt-3 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(namToneLabel)}">
+                        ${isDirect ? `<label class="mt-3 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(namToneLabel)}">
                             <input type="checkbox" class="h-4 w-4 rounded border-gray-700 bg-dark-800" data-rlc-sync-nam-source="${esc(source.providerId)}" ${syncNamToneAssets ? 'checked' : ''} ${busy ? 'disabled' : ''} />
                             <span class="inline-flex items-center gap-1">${toneIcon()} NAM tones</span>
                         </label>
                         <label class="mt-2 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(allowRedirectsLabel)}">
                             <input type="checkbox" class="h-4 w-4 rounded border-gray-700 bg-dark-800" data-rlc-allow-redirects="${esc(source.providerId)}" ${allowUnsafeRedirects ? 'checked' : ''} ${busy ? 'disabled' : ''} />
                             <span class="inline-flex items-center gap-1">${shieldIcon()} Allow unsafe redirects</span>
-                        </label>`}
+                        </label>` : ''}
                         ${offline ? `<div class='mt-2 text-xs text-red-300'>This source appears to be offline.${source.message ? ' ' + esc(source.message) : ''}</div>` : (enabled && !source.checkingStatus && source.message ? `<div class="mt-1 text-xs text-amber-300">${esc(source.message)}</div>` : '')}
                     </div>
                     <div class="flex flex-shrink-0 flex-wrap gap-2">
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg ${enabled ? 'bg-green-900/40 text-green-200 hover:bg-green-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-toggle-source="${esc(source.providerId)}" data-rlc-enabled="${enabled ? 'true' : 'false'}" aria-label="${esc(toggleLabel)}" title="${esc(toggleLabel)}" aria-pressed="${enabled ? 'true' : 'false'}" ${busy ? 'disabled' : ''}>${powerIcon(enabled)}</button>
-                        ${isGoogleDrive ? '' : `<button class="flex h-10 w-10 items-center justify-center rounded-lg ${source.hasToken ? 'bg-amber-900/40 text-amber-200 hover:bg-amber-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-token="${esc(source.providerId)}" data-rlc-has-token="${source.hasToken ? 'true' : 'false'}" aria-label="${esc(tokenLabel)}" title="${esc(tokenLabel)}" ${busy ? 'disabled' : ''}>${keyIcon()}</button>`}
+                        ${isDirect ? `<button class="flex h-10 w-10 items-center justify-center rounded-lg ${source.hasToken ? 'bg-amber-900/40 text-amber-200 hover:bg-amber-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-token="${esc(source.providerId)}" data-rlc-has-token="${source.hasToken ? 'true' : 'false'}" aria-label="${esc(tokenLabel)}" title="${esc(tokenLabel)}" ${busy ? 'disabled' : ''}>${keyIcon()}</button>` : ''}
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-dark-500 hover:text-white ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-refresh-source="${esc(source.providerId)}" aria-label="${esc(refreshLabel)}" title="${esc(refreshLabel)}" ${busy ? 'disabled' : ''}>${refreshIcon(busyMode === 'refresh')}</button>
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-red-900/50 hover:text-red-300 ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-remove="${esc(source.providerId)}" aria-label="${esc(removeLabel)}" title="${esc(removeLabel)}" ${busy ? 'disabled' : ''}>${removeIcon()}</button>
                     </div>
@@ -385,7 +396,9 @@
         const token = isDirect ? (document.getElementById('rlc-token')?.value.trim() || '') : '';
         if (!baseUrl) throw new Error(isDirect
             ? 'Enter a server URL or hostname (for example: studio.local).'
-            : 'Paste a public Google Drive folder link.');
+            : type === 'proton-public.v1'
+                ? 'Paste the full Proton share link, including the password after #.'
+                : 'Paste a public Google Drive folder link.');
         if (state.adding) return;
         setBusyState({ adding: true });
         setMessage('Adding source...', 'neutral');
@@ -624,16 +637,18 @@
                 return;
             }
         });
-        // Clicking a not-yet-downloaded Google Drive library card kicks off a background
-        // download; start polling so the card shows progress. Do NOT touch the sync state
-        // here — core's syncLibrarySong bails if it sees status 'syncing', so setting it
-        // pre-emptively would swallow the click. The poller reflects the real state instead.
+        // Clicking a not-yet-downloaded background-download library card (Google Drive / Proton
+        // Drive) kicks off a background download; start polling so the card shows progress. Do
+        // NOT touch the sync state here — core's syncLibrarySong bails if it sees status
+        // 'syncing', so setting it pre-emptively would swallow the click. The poller reflects
+        // the real state instead.
         document.addEventListener('click', event => {
             const card = event.target.closest('[data-library-song][data-library-provider]');
             if (!card || card.dataset.play || event.target.closest('button')) return;
             let providerId = '';
             try { providerId = decodeURIComponent(card.getAttribute('data-library-provider') || ''); } catch (error) { return; }
-            if (!providerId.startsWith('gdrive:')) return;
+            const isProton = providerId.startsWith('proton:');
+            if (!providerId.startsWith('gdrive:') && !isProton) return;
             let songId = '';
             try { songId = decodeURIComponent(card.getAttribute('data-library-song') || ''); } catch (error) { songId = ''; }
             // Instant "downloading" toast — the v3 song page has no per-card sync badge, so a
@@ -642,7 +657,7 @@
             const key = `${providerId} ${songId}`;
             if (songId && state.downloadSeen[key] !== 'downloading') {
                 state.downloadSeen[key] = 'downloading';
-                notifyDownloading();
+                notifyDownloading(isProton ? 'Proton Drive' : 'Google Drive');
             }
             ensureDownloadPolling();
         });

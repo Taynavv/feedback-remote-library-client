@@ -12,6 +12,11 @@ from remote_library_client.google_drive import (
     is_google_drive_folder_url,
     parse_drive_folder_id,
 )
+from remote_library_client.proton_drive import (
+    ProtonPublicShareProvider,
+    is_proton_share_url,
+    parse_proton_share_url,
+)
 from remote_library_client.provider import (
     AuthRequiredError,
     BaseLibraryProvider,
@@ -39,6 +44,7 @@ DEFAULT_SOURCE_PORT = 8765
 PROVIDER_TYPES = {
     DirectLibraryProvider.type: DirectLibraryProvider,
     GoogleDrivePublicFolderProvider.type: GoogleDrivePublicFolderProvider,
+    ProtonPublicShareProvider.type: ProtonPublicShareProvider,
 }
 
 
@@ -255,6 +261,66 @@ def _save_checked_google_source(source: dict) -> dict:
     }
 
 
+def _proton_source(seed: dict, provider: BaseLibraryProvider | None = None) -> dict:
+    """Build (or refresh) a Proton public-share source: parse the token + URL password from the
+    pasted link, then authenticate + list to validate reachability and count songs. The URL
+    password is a secret — stored as ``urlPassword``, never placed in the displayable ``baseUrl``.
+
+    Pass an already-registered ``provider`` to reuse its cached SRP session — Proton rate-limits
+    repeated anonymous auth, so a fresh handshake on every status poll would risk a throttle.
+    """
+    parsed = parse_proton_share_url(seed.get("baseUrl") or "")
+    token = str(seed.get("shareToken") or (parsed[0] if parsed else "")).strip()
+    password = str(seed.get("urlPassword") or (parsed[1] if parsed else "")).strip()
+    if not token:
+        raise ValueError("not a recognizable Proton public-share URL")
+    if not password:
+        raise ValueError("paste the full Proton share link, including the password after '#'")
+    base_url = f"https://drive.proton.me/urls/{token}"
+    source = {
+        **seed,
+        "type": ProtonPublicShareProvider.type,
+        "baseUrl": base_url,
+        "shareToken": token,
+        "urlPassword": password,
+        "providerId": seed.get("providerId")
+        or provider_id_for_source(f"proton_{token}", base_url, prefix="proton"),
+        "enabled": _source_enabled(seed),
+        "syncNamToneAssets": False,
+        "allowUnsafeRedirects": bool(seed.get("allowUnsafeRedirects")),
+        "token": "",
+    }
+    info = (provider or _provider_for_source(source)).describe_source()
+    label = str(seed.get("label") or "").strip()
+    source.update({
+        "sourceId": info["sourceId"],
+        "sourceName": info["sourceName"],
+        "label": label or seed.get("label") or info["sourceName"],
+        "protocol": ProtonPublicShareProvider.type,
+        "songCount": _safe_int(info.get("songCount"), 0),
+        "remoteCapabilities": list(info.get("capabilities") or []),
+        "namToneSyncAvailable": False,
+        "authRequired": False,
+        "lastSuccessfulContactAt": _utc_now_iso(),
+    })
+    return source
+
+
+def _save_checked_proton_source(source: dict) -> dict:
+    # Reuse the registered provider (and its cached session) when present; only build + register
+    # a fresh one when the source is not yet registered (e.g. first add, or after a restart).
+    existing = _providers.get(source.get("providerId") or "")
+    updated = _proton_source(source, provider=existing)
+    provider = existing or _register_source_provider(updated, replace=True)
+    _store.upsert_source(updated)
+    return {
+        **updated,
+        "registered": bool(provider and provider.id in _providers),
+        "online": True,
+        "message": "",
+    }
+
+
 def _provider_payload(provider: BaseLibraryProvider | None) -> dict | None:
     if not provider:
         return None
@@ -262,8 +328,9 @@ def _provider_payload(provider: BaseLibraryProvider | None) -> dict | None:
 
 
 def _public_source(source: dict) -> dict:
-    # Never echo the stored token back to the browser; expose only whether one is set.
-    public = {key: value for key, value in source.items() if key != "token"}
+    # Never echo stored secrets back to the browser: the Remote Library Server bearer `token`
+    # and the Proton share `urlPassword` (the URL fragment). Expose only whether a token is set.
+    public = {key: value for key, value in source.items() if key not in ("token", "urlPassword")}
     public["hasToken"] = bool(str(source.get("token") or "").strip())
     return public
 
@@ -329,6 +396,13 @@ def setup(app, context):
                     item["message"] = _public_error_message(exc)
                 sources.append(_public_source(item))
                 continue
+            if _source_type(source) == ProtonPublicShareProvider.type:
+                try:
+                    item.update(_save_checked_proton_source(source))
+                except Exception as exc:
+                    item["message"] = _public_error_message(exc)
+                sources.append(_public_source(item))
+                continue
             try:
                 payload = _probe_source(source.get("baseUrl") or "", source.get("token") or "")
                 item.update(_save_checked_source(source, payload))
@@ -348,6 +422,21 @@ def setup(app, context):
         source_type = str(data.get("type") or "").strip()
         # Honor the explicit type from the add form's picker; fall back to URL auto-detection
         # for API callers that omit it.
+        use_proton = source_type == ProtonPublicShareProvider.type or (
+            not source_type and is_proton_share_url(raw_url)
+        )
+        if use_proton:
+            try:
+                source = _proton_source({
+                    "baseUrl": raw_url,
+                    "label": str(data.get("label") or "").strip(),
+                    "allowUnsafeRedirects": bool(data.get("allowUnsafeRedirects")),
+                })
+                provider = _register_source_provider(source, replace=True)
+                _store.upsert_source(source)
+                return {"ok": True, "source": _public_source(source), "provider": _provider_payload(provider)}
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
         use_google = source_type == GoogleDrivePublicFolderProvider.type or (
             not source_type and is_google_drive_folder_url(raw_url)
         )
@@ -393,6 +482,13 @@ def setup(app, context):
         if _source_type(source) == GoogleDrivePublicFolderProvider.type:
             try:
                 updated = _save_checked_google_source(source)
+                provider = _providers.get(updated.get("providerId") or "")
+                return {"ok": True, "source": _public_source(updated), "provider": _provider_payload(provider)}
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
+        if _source_type(source) == ProtonPublicShareProvider.type:
+            try:
+                updated = _save_checked_proton_source(source)
                 provider = _providers.get(updated.get("providerId") or "")
                 return {"ok": True, "source": _public_source(updated), "provider": _provider_payload(provider)}
             except Exception as exc:

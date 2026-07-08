@@ -1,14 +1,16 @@
 # Remote Library Client
 
-Remote Library Client connects [FeedBack](https://github.com/got-feedback/feedBack) to one or more remote libraries. Each configured source is registered as a FeedBack library provider, so it appears in the core Library source selector. Two source types are supported:
+Remote Library Client connects [FeedBack](https://github.com/got-feedback/feedBack) to one or more remote libraries. Each configured source is registered as a FeedBack library provider, so it appears in the core Library source selector. Three source types are supported:
 
 - **Remote Library Server** — a [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server) URL speaking the full metadata/search/artwork/NAM-tone protocol.
 - **Public Google Drive folder** — a public ("anyone with the link") Google Drive folder of package files; paste the folder link and its songs show up in FeedBack. See [Source types](#source-types).
+- **Public Proton Drive share** — an anonymous, end-to-end-encrypted Proton Drive share of package files; paste the share link (with its password) and its songs show up in FeedBack. See [Source types](#source-types).
 
 > [!CAUTION]
-> **This plugin downloads and imports arbitrary files from whatever server or folder you point it at.**
-> A Remote Library Server — or a Google Drive folder — you connect to fully controls the metadata and,
-> above all, the **package files** this client downloads into your local library and then plays.
+> **This plugin downloads and imports arbitrary files from whatever server, folder, or share you point it at.**
+> A source you connect to — a Remote Library Server, a Google Drive folder, or a Proton Drive share — fully
+> controls the metadata and, above all, the **package files** this client downloads into your local library
+> and then plays.
 > **Only connect to sources run by people you trust.** Don't add a URL a stranger handed you, and
 > don't download or play content you can't identify. A malicious or compromised source can hand
 > you a hostile file. If you connect to someone sketchy and it costs you — a trojan, junk data,
@@ -44,6 +46,24 @@ Notes and limits:
 - Metadata quality depends on the filename convention; oddly-named files still appear, just with a best-effort artist/title.
 - Google temporarily **rate-limits a very popular file** (roughly 24 hours) when many people download it; the client surfaces a clear "try again later" message rather than a cryptic failure.
 
+### Public Proton Drive share (`proton-public.v1`)
+
+An anonymous, **end-to-end-encrypted** Proton Drive **public share** of package files. Choose **Proton Drive** in the type picker and paste the share link — e.g. `https://drive.proton.me/urls/<token>#<password>` — and the client:
+
+- **authenticates anonymously** to the share (an SRP handshake against the share token — no Proton account, no login);
+- **decrypts the folder listing** and lists its `.feedpak` (or legacy `.sloppak`) files. Community shares follow an `Artist-Title.feedpak` (or `Artist - Album - Title.feedpak`) convention, so artist / title come from the filename — there is no server API, artwork, or tuning data;
+- **downloads and decrypts** a song's content blocks into your local library the first time you play it, in the background (exactly like Google Drive — see below).
+
+Paste the **whole** share link, including the `#…` password fragment — that password is the decryption key and never leaves your machine (it is stored with the source and stripped from every response, like an access token). No Proton login is required.
+
+**Playing a song** works exactly like the Google Drive type: the first click on a not-yet-downloaded song shows a **"Downloading…"** notification and fetches + decrypts in the background; a **"Ready to play"** notification lands when it's done; click again to play. Already-downloaded songs play on the first click.
+
+Notes and limits:
+
+- The share must be a **public** ("anyone with the link") share, and the link must include its **generated password** (the `#…` fragment). Shares with a separate custom password are not supported yet.
+- This is the one source type with a **native dependency**: Proton's encryption requires `bcrypt` and `pysequoia`, listed in [requirements.txt](requirements.txt) and installed by FeedBack on load. The other two source types have no dependencies, so they keep working even where these can't be installed.
+- Proton's public-share API is undocumented and changes over time; if listing suddenly fails, the plugin may need an update.
+
 ## Flow
 
 The **Remote Library Server** type speaks this REST protocol. (The **Google Drive** type has no server — it enumerates a public folder and downloads packages directly; see [Source types](#source-types).)
@@ -70,9 +90,10 @@ flowchart LR
 1. Install this client plugin in FeedBack.
 2. Open **Remote Client**, click **+**, and choose a **Source type**:
    - **Google Drive** — paste a public ("anyone with the link") folder link. No server, login, or token required.
+   - **Proton Drive** — paste a public share link *including its `#…` password*. No Proton account or login required.
    - **Remote Library Server** — enter the server's base URL (plus an access token if it requires one); see [Adding a Remote Library Server](#adding-a-remote-library-server).
 3. Add a label if you like, click **Add**, then open the main **Library** screen and pick your source from the source selector.
-4. Click a song to load it into your local library and play it. A song from a Google Drive folder downloads in the background the first time you play it (see [Source types](#source-types)); a Remote Library Server song loads straight from the server.
+4. Click a song to load it into your local library and play it. A song from a Google Drive folder or a Proton Drive share downloads (and, for Proton, decrypts) in the background the first time you play it (see [Source types](#source-types)); a Remote Library Server song loads straight from the server.
 
 ### Adding a Remote Library Server
 
