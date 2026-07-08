@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import html
 import re
+import threading
+import time
 from collections import OrderedDict
 from pathlib import Path
 from urllib import error, parse, request
@@ -24,9 +26,11 @@ from remote_library_client.provider import (
     BaseLibraryProvider,
     LibraryImporter,
     _header_filename,
+    _public_error_message,
     _read_limited,
     _remote_error,
     _safe_int,
+    playback_settings_key,
     provider_id_for_source,
     sanitize_filename,
 )
@@ -64,6 +68,15 @@ def format_from_filename(filename: str) -> str:
         return "psarc"
     # .feedpak / .sloppak / .zip — and anything else we chose to accept — are sloppak-family.
     return "sloppak"
+
+
+def package_form_from_filename(filename: str) -> str:
+    # Must be one of FeedBack's known PackageForm values (a .feedpak is a zipped sloppak);
+    # an unrecognized value is treated as unsupported by core and the song won't be syncable.
+    suffix = Path(filename or "").suffix.lower()
+    if suffix == ".psarc":
+        return "psarc-file"
+    return "sloppak-zip"
 
 
 def parse_feedpak_filename(filename: str) -> tuple[str, str, str]:
@@ -117,6 +130,13 @@ class GoogleDrivePublicFolderProvider(BaseLibraryProvider):
         )
         self.base_url = base_url
         self.label = str(source.get("label") or source.get("sourceName") or f"Google Drive folder {folder_id[:8]}")
+        # Background-sync state. FeedBack core caps the sync-song capability at ~250ms — far
+        # too short for an internet download — so sync_song kicks the download off in a
+        # background thread and returns immediately; the song plays on the next click once
+        # the file has landed in the local library. See sync_song.
+        self._sync_lock = threading.Lock()
+        # song_id -> {"status": downloading|ready|error, "title", "at", "result"?, "message"?}
+        self._downloads: dict[str, dict] = {}
 
     # -- HTTP helpers ----------------------------------------------------
 
@@ -157,12 +177,32 @@ class GoogleDrivePublicFolderProvider(BaseLibraryProvider):
 
     # -- normalization + querying ---------------------------------------
 
-    def _normalize_entry(self, entry: dict) -> dict:
+    def _downloaded_names(self) -> frozenset[str]:
+        """Filenames already sitting in this source's local library folder. A browsed song
+        that matches one is exposed as a directly-playable local file (one-click play, local
+        artwork, working overflow-menu Play) instead of a remote row that must be synced."""
+        if not self.local_library_root or not self.local_library_root.exists():
+            return frozenset()
+        folder = self.local_library_root / self._source_folder_name()
+        try:
+            return frozenset(item.name for item in folder.iterdir() if item.is_file())
+        except OSError:
+            return frozenset()
+
+    def _normalize_entry(self, entry: dict, downloaded: frozenset[str] = frozenset()) -> dict:
         file_id = entry["file_id"]
         filename = entry["filename"]
         artist, album, title = parse_feedpak_filename(filename)
+        safe_name = sanitize_filename(Path(filename).name, "remote-song.feedpak")
+        # Already downloaded → point the card at the local file. `filename` drives the
+        # overflow-menu Play and `localFilename` drives the card (data-play) + local artwork.
+        local = f"{self._source_folder_name()}/{safe_name}" if safe_name in downloaded else ""
+        # Otherwise mirror the shape a Remote Library Server emits for a *syncable* song (the
+        # server's RemoteSongSummary): FeedBack core keys the "syncable / playable" state off
+        # syncSupport / status / packageForm / capabilities, and packageForm must be a known
+        # value — a .feedpak is a zipped sloppak.
         return {
-            "filename": file_id,
+            "filename": local or file_id,
             "song_id": file_id,
             "remote_id": file_id,
             "remoteSongId": file_id,
@@ -174,22 +214,32 @@ class GoogleDrivePublicFolderProvider(BaseLibraryProvider):
             "title": title,
             "artist": artist or "Unknown artist",
             "album": album,
+            "year": None,
+            "duration": None,
             "format": format_from_filename(filename),
-            "packageForm": "feedpak-file",
-            "stem_count": 0,
-            "stem_ids": [],
-            "localFilename": "",
-            "local_filename": "",
-            "playFilename": "",
+            "packageForm": package_form_from_filename(filename),
+            "syncSupport": "syncable",
+            "status": "remote-only",
+            "capabilities": ["package-download"],
+            "settingsKey": playback_settings_key(filename),
             "arrangements": [],
             "has_lyrics": False,
+            "hasLyrics": False,
+            "stem_count": 0,
+            "stemCount": 0,
+            "stem_ids": [],
+            "stemIds": [],
             "tuning": "",
             "tuning_name": "",
             "sizeBytes": 0,
+            "localFilename": local,
+            "local_filename": local,
+            "playFilename": local,
         }
 
     def _all_songs(self) -> list[dict]:
-        songs = [self._normalize_entry(entry) for entry in self._entries()]
+        downloaded = self._downloaded_names()
+        songs = [self._normalize_entry(entry, downloaded) for entry in self._entries()]
         songs.sort(key=lambda song: (song["artist"].lower(), song["album"].lower(), song["title"].lower()))
         return songs
 
@@ -314,7 +364,128 @@ class GoogleDrivePublicFolderProvider(BaseLibraryProvider):
         confirmed = self._confirmed_download_url(html_text, file_id)
         return self._download_url_to_cache(confirmed, fallback_filename, self._headers())
 
+    def _download_label(self, song_id: str, entry: dict | None = None) -> str:
+        entry = entry or self._entry_by_id(song_id)
+        if not entry:
+            return song_id
+        artist, _album, title = parse_feedpak_filename(entry["filename"])
+        if artist and artist != "Unknown artist":
+            return f"{artist} – {title}"
+        return title or entry["filename"]
+
     def sync_song(self, song_id: str) -> dict:
+        # Non-blocking by necessity: FeedBack core caps the sync-song capability at ~250ms,
+        # which an internet download cannot meet. So return immediately — if the file is
+        # already local, play it now; otherwise start the download in the background and
+        # report "downloading". The plugin screen polls active_downloads() to show progress
+        # on the card, and the next click plays the song once it has landed.
+        ready = self._local_ready(song_id)
+        if ready:
+            return ready
+        with self._sync_lock:
+            entry = self._downloads.get(song_id)
+            already_running = bool(entry and entry.get("status") == "downloading")
+            if not already_running:
+                self._downloads[song_id] = {
+                    "status": "downloading",
+                    "title": self._download_label(song_id),
+                    "at": time.monotonic(),
+                }
+        if not already_running:
+            self._start_background_sync(song_id)
+        return self._downloading_result(song_id)
+
+    def _start_background_sync(self, song_id: str) -> None:
+        threading.Thread(target=self._background_sync, args=(song_id,), daemon=True).start()
+
+    def _background_sync(self, song_id: str) -> None:
+        title = self._download_label(song_id)
+        try:
+            result = self._do_sync(song_id)
+            entry = {"status": "ready", "title": title, "at": time.monotonic(), "result": result}
+        except Exception as exc:  # noqa: BLE001 — record and allow a retry on the next click
+            entry = {"status": "error", "title": title, "at": time.monotonic(),
+                     "message": _public_error_message(exc)}
+        with self._sync_lock:
+            self._downloads[song_id] = entry
+
+    def _downloading_result(self, song_id: str) -> dict:
+        return {
+            "ok": True,
+            "song_id": song_id,
+            "remoteSongId": song_id,
+            "cached": False,
+            "cacheState": "downloading",
+            "message": "Downloading from Google Drive…",
+        }
+
+    def _local_ready(self, song_id: str) -> dict | None:
+        """A completed sync result for a song already in the local library, else None.
+
+        Checks this session's finished downloads first, then the filesystem — so a song
+        synced in a previous session (still indexed in the local library) plays at once."""
+        with self._sync_lock:
+            entry = self._downloads.get(song_id)
+        if entry and entry.get("status") == "ready":
+            result = entry.get("result") or {}
+            if result.get("filename"):
+                return result
+        meta = self._entry_by_id(song_id)
+        if not meta or not self.local_library_root or not self.local_library_root.exists():
+            return None
+        candidate = self.local_library_root / self._source_folder_name() / sanitize_filename(
+            Path(meta["filename"]).name, "remote-song.feedpak"
+        )
+        if not candidate.is_file():
+            return None
+        relative = candidate.relative_to(self.local_library_root).as_posix()
+        result = {
+            "ok": True,
+            "song_id": song_id,
+            "remoteSongId": song_id,
+            "cached": True,
+            "cacheState": "ready",
+            "filename": relative,
+            "localFilename": relative,
+            "local_filename": relative,
+            "playFilename": relative,
+            "libraryRelativePath": relative,
+            "libraryImportState": "indexed",
+            "playbackSource": "library-folder",
+        }
+        with self._sync_lock:
+            self._downloads[song_id] = {
+                "status": "ready", "title": self._download_label(song_id, meta),
+                "at": time.monotonic(), "result": result,
+            }
+        return result
+
+    def active_downloads(self, max_age_seconds: float = 300.0) -> list[dict]:
+        """Per-song download status for the plugin screen's progress poller. Finished
+        (ready / error) entries are pruned after a TTL so the list stays small."""
+        now = time.monotonic()
+        items = []
+        with self._sync_lock:
+            for stale in [
+                key for key, value in self._downloads.items()
+                if value.get("status") != "downloading" and now - value.get("at", now) > max_age_seconds
+            ]:
+                self._downloads.pop(stale, None)
+            for song_id, entry in self._downloads.items():
+                item = {
+                    "providerId": self.id,
+                    "songId": song_id,
+                    "title": entry.get("title") or song_id,
+                    "status": entry.get("status") or "downloading",
+                }
+                if entry.get("status") == "ready":
+                    item["localFilename"] = (entry.get("result") or {}).get("filename") or ""
+                elif entry.get("status") == "error":
+                    item["message"] = entry.get("message") or ""
+                items.append(item)
+        return items
+
+    def _do_sync(self, song_id: str) -> dict:
         entry = self._entry_by_id(song_id)
         remote_name = (entry or {}).get("filename") or song_id
         fallback_filename = sanitize_filename(remote_name, "remote-song.feedpak")

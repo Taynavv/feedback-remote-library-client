@@ -137,6 +137,23 @@ def test_enumerate_parses_sorts_and_skips_non_packages(tmp_path):
     assert songs[0]["libraryProviderId"] == provider.id
 
 
+def test_songs_carry_syncable_shape_like_direct_provider(tmp_path):
+    # FeedBack core renders a provider song as playable/syncable only when it carries the
+    # same first-class fields a Remote Library Server emits; a bare metadata dict renders
+    # as a non-playable row (checkbox + "add to playlist" only).
+    provider = FakeGoogleProvider(tmp_path, folder_html=_folder_html(FAKE_FILES))
+
+    song = provider.query_page(size=50)[0][0]
+
+    assert song["syncSupport"] == "syncable"
+    assert song["status"] == "remote-only"
+    assert song["packageForm"] == "sloppak-zip"  # a valid PackageForm, not a made-up value
+    assert song["capabilities"] == ["package-download"]
+    assert song["settingsKey"]
+    assert song["song_id"]
+    assert song["localFilename"] == ""  # not downloaded yet -> core shows the sync/play affordance
+
+
 def test_query_page_paginates(tmp_path):
     provider = FakeGoogleProvider(tmp_path, folder_html=_folder_html(FAKE_FILES))
 
@@ -180,6 +197,27 @@ def test_query_stats_counts_songs_artists_and_letters(tmp_path):
     assert stats["letters"] == {"A": 1, "Z": 1}
 
 
+def test_query_page_marks_downloaded_songs_as_local(tmp_path):
+    local_root = tmp_path / "dlc"
+    name = "Alpha Testers - First Fake Album - Song Alpha.feedpak"
+    provider = FakeGoogleProvider(
+        tmp_path / "cache",
+        folder_html=_folder_html([("FID000000000002", name)]),
+        local_library_root=local_root,
+    )
+    target = local_root / provider._source_folder_name() / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"downloaded")
+
+    song = provider.query_page(size=50)[0][0]
+
+    relative = f"{provider._source_folder_name()}/{name}"
+    assert song["localFilename"] == relative
+    assert song["playFilename"] == relative
+    assert song["filename"] == relative  # overflow-menu Play targets the local file
+    assert song["song_id"] == "FID000000000002"  # remote id preserved for the provider
+
+
 def test_enumeration_is_cached(tmp_path):
     provider = FakeGoogleProvider(tmp_path, folder_html=_folder_html(FAKE_FILES))
     calls = {"n": 0}
@@ -218,7 +256,14 @@ def test_describe_source_reports_type_and_count(tmp_path):
 # ------------------------------------------------------------------------------- download
 
 
-def test_sync_song_downloads_and_imports_into_library(tmp_path):
+def _package_response(name):
+    return _FakeHTTPResponse(
+        [b"fake-package-bytes"],
+        {"content-type": "application/octet-stream", "content-disposition": f'attachment; filename="{name}"'},
+    )
+
+
+def test_do_sync_downloads_and_imports_into_library(tmp_path):
     local_root = tmp_path / "dlc"
     local_root.mkdir()
     imported = []
@@ -228,19 +273,15 @@ def test_sync_song_downloads_and_imports_into_library(tmp_path):
         return {"libraryImportState": "indexed", "libraryFilename": path.relative_to(root).as_posix()}
 
     name = "Fake Band - Fake Album - Fake Song.feedpak"
-    response = _FakeHTTPResponse(
-        [b"fake-package-bytes"],
-        {"content-type": "application/octet-stream", "content-disposition": f'attachment; filename="{name}"'},
-    )
     provider = FakeGoogleProvider(
         tmp_path / "cache",
         folder_html=_folder_html([("FID000000000001", name)]),
-        responses=[response],
+        responses=[_package_response(name)],
         local_library_root=local_root,
         library_importer=importer,
     )
 
-    result = provider.sync_song("FID000000000001")
+    result = provider._do_sync("FID000000000001")
 
     assert result["ok"] is True
     assert result["playbackSource"] == "library-folder"
@@ -250,23 +291,105 @@ def test_sync_song_downloads_and_imports_into_library(tmp_path):
     assert len(imported) == 1
 
 
-def test_sync_song_falls_back_to_cache_without_local_root(tmp_path):
+def test_do_sync_falls_back_to_cache_without_local_root(tmp_path):
     name = "Fake Band - Fake Album - Fake Song.feedpak"
-    response = _FakeHTTPResponse(
-        [b"fake-package-bytes"],
-        {"content-type": "application/octet-stream", "content-disposition": f'attachment; filename="{name}"'},
-    )
     provider = FakeGoogleProvider(
         tmp_path / "cache",
         folder_html=_folder_html([("FID000000000001", name)]),
-        responses=[response],
+        responses=[_package_response(name)],
     )
 
-    result = provider.sync_song("FID000000000001")
+    result = provider._do_sync("FID000000000001")
 
     assert result["ok"] is True
     assert result["playbackSource"] == "remote-cache"
     assert result["bytes"] == len(b"fake-package-bytes")
+
+
+def test_sync_song_is_non_blocking_then_plays(tmp_path):
+    # The first click returns "downloading" immediately (core's ~250ms sync budget is too
+    # short to download over the internet); the download runs in the background, and the
+    # next click plays the now-local file.
+    local_root = tmp_path / "dlc"
+    local_root.mkdir()
+    name = "Fake Band - Fake Album - Fake Song.feedpak"
+    provider = FakeGoogleProvider(
+        tmp_path / "cache",
+        folder_html=_folder_html([("FID000000000001", name)]),
+        responses=[_package_response(name)],
+        local_library_root=local_root,
+        library_importer=lambda path, root: {"libraryImportState": "indexed"},
+    )
+    # Run the "background" download inline so the test is deterministic.
+    provider._start_background_sync = provider._background_sync
+
+    first = provider.sync_song("FID000000000001")
+    assert first["cacheState"] == "downloading"
+    assert "filename" not in first  # nothing to play yet
+
+    second = provider.sync_song("FID000000000001")
+    assert second["playbackSource"] == "library-folder"
+    assert second["libraryImportState"] == "indexed"
+    assert second["localFilename"].endswith(name)
+
+
+def test_sync_song_dedupes_concurrent_downloads(tmp_path):
+    name = "Fake Band - Fake Album - Fake Song.feedpak"
+    provider = FakeGoogleProvider(tmp_path / "cache", folder_html=_folder_html([("FID000000000001", name)]))
+    spawned = []
+    provider._start_background_sync = lambda song_id: spawned.append(song_id)
+
+    provider.sync_song("FID000000000001")
+    provider.sync_song("FID000000000001")
+
+    assert spawned == ["FID000000000001"]  # only one download starts while one is in flight
+
+
+def test_sync_song_plays_already_downloaded_file(tmp_path):
+    # A song whose file already sits in the local library (e.g. synced last session) plays
+    # on the first click, no re-download.
+    local_root = tmp_path / "dlc"
+    name = "Fake Band - Fake Album - Fake Song.feedpak"
+    provider = FakeGoogleProvider(
+        tmp_path / "cache",
+        folder_html=_folder_html([("FID000000000001", name)]),
+        local_library_root=local_root,
+    )
+    target = local_root / provider._source_folder_name() / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"already-here")
+
+    result = provider.sync_song("FID000000000001")
+
+    assert result["cacheState"] == "ready"
+    assert result["localFilename"].endswith(name)
+
+
+def test_active_downloads_reports_downloading_then_ready(tmp_path):
+    local_root = tmp_path / "dlc"
+    local_root.mkdir()
+    name = "Fake Band - Fake Album - Fake Song.feedpak"
+    provider = FakeGoogleProvider(
+        tmp_path / "cache",
+        folder_html=_folder_html([("FID000000000001", name)]),
+        responses=[_package_response(name)],
+        local_library_root=local_root,
+        library_importer=lambda path, root: {"libraryImportState": "indexed"},
+    )
+    provider._start_background_sync = lambda song_id: None  # hold it in the "downloading" state
+
+    provider.sync_song("FID000000000001")
+    downloading = provider.active_downloads()
+    assert len(downloading) == 1
+    assert downloading[0]["status"] == "downloading"
+    assert downloading[0]["songId"] == "FID000000000001"
+    assert downloading[0]["providerId"] == provider.id
+    assert downloading[0]["title"]  # a human label for the progress UI, not the raw id
+
+    provider._background_sync("FID000000000001")  # complete the download
+    ready = provider.active_downloads()
+    assert ready[0]["status"] == "ready"
+    assert ready[0]["localFilename"].endswith(name)
 
 
 def test_download_uses_confirm_flow_for_large_file(tmp_path):
@@ -356,3 +479,39 @@ def test_add_google_source_registers_provider(tmp_path, monkeypatch):
     assert provider_id in registered
     google_status = [item for item in status.json()["sources"] if item.get("type") == "google-drive-public.v1"]
     assert google_status and google_status[0]["online"] is True
+
+
+def test_add_source_honors_explicit_type(tmp_path, monkeypatch):
+    routes = importlib.reload(importlib.import_module("routes"))
+    monkeypatch.setattr(
+        GoogleDrivePublicFolderProvider,
+        "_fetch_folder_html",
+        lambda self: _folder_html([("FID000000000001", "Band - Album - Song.feedpak")]),
+    )
+    monkeypatch.setattr(routes, "_probe_source", lambda base_url, token="": {
+        "ok": True, "sourceId": "studio", "sourceName": "Studio", "songCount": 5,
+        "server": {"protocol": "slopsmith-direct-library.v1"},
+    })
+    app = FastAPI()
+    routes.setup(app, {
+        "config_dir": tmp_path / "config",
+        "register_library_provider": lambda provider, replace=False: None,
+        "get_sloppak_cache_dir": lambda: tmp_path / "cache",
+        "get_dlc_dir": lambda: None,
+    })
+    client = TestClient(app)
+
+    google = client.post("/api/plugins/remote_library_client/sources", json={
+        "type": "google-drive-public.v1",
+        "baseUrl": "https://drive.google.com/drive/folders/FOLDERID0001234",
+    })
+    assert google.status_code == 200
+    assert google.json()["source"]["type"] == "google-drive-public.v1"
+
+    direct = client.post("/api/plugins/remote_library_client/sources", json={
+        "type": "slopsmith-direct-library.v1",
+        "baseUrl": "studio.local",
+    })
+    assert direct.status_code == 200
+    assert direct.json()["source"]["songCount"] == 5  # routed through the Remote Library Server probe
+    assert "studio.local" in direct.json()["source"]["baseUrl"]

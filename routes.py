@@ -291,6 +291,21 @@ def setup(app, context):
         data = _store.load()
         return {"sources": [_public_source(item) for item in data.get("sources") or []]}
 
+    @app.get("/api/plugins/remote_library_client/downloads")
+    def downloads():
+        # In-progress / recently-finished background song downloads, for the screen's
+        # progress poller (Google Drive sources download out-of-band; see google_drive.py).
+        items = []
+        for provider in list(_providers.values()):
+            reporter = getattr(provider, "active_downloads", None)
+            if not callable(reporter):
+                continue
+            try:
+                items.extend(reporter())
+            except Exception:
+                continue
+        return {"downloads": items}
+
     @app.get("/api/plugins/remote_library_client/status")
     def status():
         sources = []
@@ -330,7 +345,13 @@ def setup(app, context):
     @app.post("/api/plugins/remote_library_client/sources")
     def add_source(data: dict):
         raw_url = data.get("baseUrl") or data.get("url") or ""
-        if is_google_drive_folder_url(raw_url):
+        source_type = str(data.get("type") or "").strip()
+        # Honor the explicit type from the add form's picker; fall back to URL auto-detection
+        # for API callers that omit it.
+        use_google = source_type == GoogleDrivePublicFolderProvider.type or (
+            not source_type and is_google_drive_folder_url(raw_url)
+        )
+        if use_google:
             try:
                 source = _google_source({
                     "baseUrl": raw_url,

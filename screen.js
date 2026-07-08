@@ -8,7 +8,10 @@
         adding: false,
         statusTimer: null,
         sourceBusy: {},
-        tokenEditor: null
+        tokenEditor: null,
+        downloadPollTimer: null,
+        downloadSeen: {},
+        downloadIdleTicks: 0
     };
     window.__remoteLibraryClientPlugin = state;
     if (typeof state.addOpen !== 'boolean') state.addOpen = false;
@@ -18,6 +21,9 @@
     if (!('statusTimer' in state)) state.statusTimer = null;
     if (!state.sourceBusy || typeof state.sourceBusy !== 'object') state.sourceBusy = {};
     if (!('tokenEditor' in state)) state.tokenEditor = null;
+    if (!('downloadPollTimer' in state)) state.downloadPollTimer = null;
+    if (!state.downloadSeen || typeof state.downloadSeen !== 'object') state.downloadSeen = {};
+    if (typeof state.downloadIdleTicks !== 'number') state.downloadIdleTicks = 0;
 
     const STALE_AFTER_MS = 5 * 60 * 1000;
 
@@ -37,6 +43,26 @@
         node.className = `mt-2 min-h-5 text-sm ${tone === 'error' ? 'text-red-300' : tone === 'success' ? 'text-green-300' : 'text-gray-400'}`;
     }
 
+    function selectedSourceType() {
+        return document.getElementById('rlc-type')?.value || 'google-drive-public.v1';
+    }
+
+    // Per-type add form: the Access token field only applies to a Remote Library Server, so
+    // hide it (and re-label the URL field) for Google Drive.
+    function applyTypeUI() {
+        const isDirect = selectedSourceType() === 'slopsmith-direct-library.v1';
+        const tokenRow = document.getElementById('rlc-token-row');
+        if (tokenRow) tokenRow.classList.toggle('hidden', !isDirect);
+        const urlLabel = document.getElementById('rlc-base-url-label');
+        if (urlLabel) urlLabel.textContent = isDirect ? 'Server URL' : 'Google Drive folder link';
+        const urlInput = document.getElementById('rlc-base-url');
+        if (urlInput) {
+            urlInput.placeholder = isDirect
+                ? 'studio.local or http://192.168.1.x:8765'
+                : 'https://drive.google.com/drive/folders/…';
+        }
+    }
+
     function setAddFormOpen(open, { focus = false } = {}) {
         state.addOpen = !!open;
         const form = document.getElementById('remote-library-client-add-form');
@@ -46,6 +72,7 @@
             toggle.setAttribute('aria-expanded', state.addOpen ? 'true' : 'false');
             toggle.textContent = state.addOpen ? 'x' : '+';
         }
+        if (state.addOpen) applyTypeUI();
         if (state.addOpen && focus) document.getElementById('rlc-base-url')?.focus();
     }
 
@@ -162,6 +189,73 @@
             throw err;
         }
         return data;
+    }
+
+    // --- Background-download progress feedback -------------------------------------------
+    // Google Drive (and any slow) sources download out-of-band: FeedBack core caps the
+    // sync-song capability at ~250ms, so the plugin downloads in the background and reports
+    // status at /downloads. We reflect that onto the core library card's own sync badge
+    // (window._setLibrarySyncState — degrade silently if core doesn't expose it) so the
+    // user sees "Loading package…" while it fetches and "Ready to play" when it lands.
+    const DOWNLOAD_POLL_MS = 1500;
+
+    function setCoreSyncState(providerId, songId, next) {
+        if (typeof window._setLibrarySyncState !== 'function') return;
+        try { window._setLibrarySyncState(providerId, songId, next); } catch (error) { /* core internal changed */ }
+    }
+
+    function notifyReady(title) {
+        if (!window.fbNotify || typeof window.fbNotify.show !== 'function') return;
+        try { window.fbNotify.show({ title: 'Ready to play', message: title || 'Song downloaded', icon: '🎵' }); }
+        catch (error) { /* notifications unavailable */ }
+    }
+
+    function notifyDownloading() {
+        if (!window.fbNotify || typeof window.fbNotify.show !== 'function') return;
+        try { window.fbNotify.show({ title: 'Downloading…', message: 'Fetching from Google Drive…', icon: '⬇️' }); }
+        catch (error) { /* notifications unavailable */ }
+    }
+
+    async function pollDownloads() {
+        let items = [];
+        try { items = (await api('/downloads')).downloads || []; } catch (error) { items = []; }
+        let anyActive = false;
+        for (const item of items) {
+            const key = `${item.providerId} ${item.songId}`;
+            const previous = state.downloadSeen[key];
+            if (item.status === 'downloading') {
+                anyActive = true;
+                setCoreSyncState(item.providerId, item.songId, { status: 'syncing' });
+            } else if (item.status === 'ready') {
+                setCoreSyncState(item.providerId, item.songId, {
+                    status: 'synced', message: 'Ready to play', localFilename: item.localFilename || ''
+                });
+                if (previous === 'downloading') notifyReady(item.title);
+            } else if (item.status === 'error') {
+                setCoreSyncState(item.providerId, item.songId, { status: 'error', message: item.message || 'Download failed' });
+            }
+            state.downloadSeen[key] = item.status;
+        }
+        // A click restarts polling; stop once nothing is actively downloading so we don't
+        // poll forever in the background.
+        if (anyActive) {
+            state.downloadIdleTicks = 0;
+        } else if ((state.downloadIdleTicks = (state.downloadIdleTicks || 0) + 1) >= 3) {
+            stopDownloadPolling();
+        }
+    }
+
+    function ensureDownloadPolling() {
+        state.downloadIdleTicks = 0;
+        if (state.downloadPollTimer) return;
+        pollDownloads();
+        state.downloadPollTimer = window.setInterval(pollDownloads, DOWNLOAD_POLL_MS);
+    }
+
+    function stopDownloadPolling() {
+        if (!state.downloadPollTimer) return;
+        window.clearInterval(state.downloadPollTimer);
+        state.downloadPollTimer = null;
     }
 
     async function refreshCoreLibraryProviders({ reloadOnChange = false } = {}) {
@@ -284,16 +378,20 @@
     }
 
     async function addSource() {
+        const type = selectedSourceType();
+        const isDirect = type === 'slopsmith-direct-library.v1';
         const baseUrl = normalizeBaseUrl(document.getElementById('rlc-base-url')?.value || '');
         const label = document.getElementById('rlc-label')?.value.trim() || '';
-        const token = document.getElementById('rlc-token')?.value.trim() || '';
-        if (!baseUrl) throw new Error('Enter a server URL or hostname (for example: studio.local).');
+        const token = isDirect ? (document.getElementById('rlc-token')?.value.trim() || '') : '';
+        if (!baseUrl) throw new Error(isDirect
+            ? 'Enter a server URL or hostname (for example: studio.local).'
+            : 'Paste a public Google Drive folder link.');
         if (state.adding) return;
         setBusyState({ adding: true });
         setMessage('Adding source...', 'neutral');
         try {
-            const body = { baseUrl, label };
-            if (token) body.token = token;
+            const body = { type, baseUrl, label };
+            if (isDirect && token) body.token = token;
             let result;
             try {
                 result = await api('/sources', { method: 'POST', body: JSON.stringify(body) });
@@ -504,6 +602,7 @@
             }
         });
         document.addEventListener('change', async event => {
+            if (event.target && event.target.id === 'rlc-type') { applyTypeUI(); return; }
             const namInput = event.target.closest('[data-rlc-sync-nam-source]');
             if (namInput) {
                 try {
@@ -524,6 +623,28 @@
                 }
                 return;
             }
+        });
+        // Clicking a not-yet-downloaded Google Drive library card kicks off a background
+        // download; start polling so the card shows progress. Do NOT touch the sync state
+        // here — core's syncLibrarySong bails if it sees status 'syncing', so setting it
+        // pre-emptively would swallow the click. The poller reflects the real state instead.
+        document.addEventListener('click', event => {
+            const card = event.target.closest('[data-library-song][data-library-provider]');
+            if (!card || card.dataset.play || event.target.closest('button')) return;
+            let providerId = '';
+            try { providerId = decodeURIComponent(card.getAttribute('data-library-provider') || ''); } catch (error) { return; }
+            if (!providerId.startsWith('gdrive:')) return;
+            let songId = '';
+            try { songId = decodeURIComponent(card.getAttribute('data-library-song') || ''); } catch (error) { songId = ''; }
+            // Instant "downloading" toast — the v3 song page has no per-card sync badge, so a
+            // toast is the visible signal. Dedupe via downloadSeen so a repeat click while it's
+            // still fetching doesn't re-toast; the poller shows "ready" on completion.
+            const key = `${providerId} ${songId}`;
+            if (songId && state.downloadSeen[key] !== 'downloading') {
+                state.downloadSeen[key] = 'downloading';
+                notifyDownloading();
+            }
+            ensureDownloadPolling();
         });
     }
 

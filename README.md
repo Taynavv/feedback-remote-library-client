@@ -20,7 +20,7 @@ The plugin declares the core `library` capability as a provider. Its manifest us
 
 ## Source types
 
-Every source implements the same FeedBack library-provider interface; the types differ only in how they reach the remote library and how much metadata it exposes. The plugin picks a type from the URL you add — no extra choice to make.
+Every source implements the same FeedBack library-provider interface; the types differ only in how they reach the remote library and how much metadata it exposes. You choose the type when adding a source (**+ → Source type**), and the form adapts — the Access token field only appears for a Remote Library Server.
 
 ### Remote Library Server (`slopsmith-direct-library.v1`)
 
@@ -28,13 +28,17 @@ The original type. A [Remote Library Server](https://github.com/Taynavv/feedback
 
 ### Public Google Drive folder (`google-drive-public.v1`)
 
-A public ("anyone with the link", no login) Google Drive **folder** of package files. Paste the folder share link — e.g. `https://drive.google.com/drive/folders/<id>` — and the client:
+A public ("anyone with the link", no login) Google Drive **folder** of package files. Choose **Google Drive** in the type picker and paste the folder share link — e.g. `https://drive.google.com/drive/folders/<id>` — and the client:
 
 - **enumerates** the folder and lists its `.feedpak` (or legacy `.sloppak`) files;
 - **derives metadata from the filenames.** Community folders follow an `Artist - Album - Title.feedpak` convention, so artist / album / title come from the name — there is no server API, artwork, tuning, or NAM-tone data to read;
-- **downloads** a song into your local library on demand when you play it.
+- **downloads** a song into your local library the first time you play it.
 
-No Google login and no API key are required: enumeration and download run on the same stdlib HTTP stack (redirect-SSRF guard + size caps) as every other request, with no third-party dependency. Notes and limits:
+No Google login and no API key are required: enumeration and download run on the same stdlib HTTP stack (redirect-SSRF guard + size caps) as every other request, with no third-party dependency.
+
+**Playing a song.** FeedBack core time-boxes the sync step to a fraction of a second, which an internet download cannot meet — so the download runs in the background. Click a not-yet-downloaded song and you get a **"Downloading…"** notification, then a **"Ready to play"** notification when it lands; click it again to play. A song already in your library plays on the **first** click and shows its artwork, exactly like a local song.
+
+Notes and limits:
 
 - The folder must be shared as **"anyone with the link."**
 - Metadata quality depends on the filename convention; oddly-named files still appear, just with a best-effort artist/title.

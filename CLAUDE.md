@@ -57,12 +57,14 @@ URL (the rich REST protocol) and a public Google Drive folder of package files.
   thing to validate if NAM mappings ever fail to resolve at playback.
 - **Provider types dispatch on the stored `type`.** `routes.py` keys `PROVIDER_TYPES` by
   each provider class's `type` attribute; a source with no `type` is the direct server
-  (`slopsmith-direct-library.v1`) for back-compat. `add_source` auto-detects Google Drive
-  folder URLs (`is_google_drive_folder_url`) and routes everything else to the existing
-  direct `/source` probe — the direct path is untouched. New backends subclass
-  `BaseLibraryProvider`, set a `type`, and register in `PROVIDER_TYPES`; both provider
-  classes share the `(source, cache_dir, local_root, importer, nam_config_dir)` ctor shape
-  so `_provider_for_source` can build any type uniformly.
+  (`slopsmith-direct-library.v1`) for back-compat. The add form leads with a **type picker**
+  (`screen.html` `#rlc-type`); the chosen `type` is sent to `add_source`, which honors it
+  (URL auto-detection via `is_google_drive_folder_url` is only a fallback for callers that
+  omit it). The per-type form hides the Access token field for Google Drive. The direct
+  `/source` probe path is untouched. New backends subclass `BaseLibraryProvider`, set a
+  `type`, and register in `PROVIDER_TYPES`; both provider classes share the
+  `(source, cache_dir, local_root, importer, nam_config_dir)` ctor shape so
+  `_provider_for_source` can build any type uniformly.
 - **Google folder metadata is filename-derived.** `google-drive-public.v1` has no server
   API — community folders are flat `.feedpak` dumps, so artist/album/title come from
   parsing the `Artist - Album - Title.feedpak` name (`parse_feedpak_filename`, best-effort
@@ -76,6 +78,17 @@ URL (the rich REST protocol) and a public Google Drive folder of package files.
   for very large files and a clear "rate-limited, try later" error on Google's ~24h
   per-file download lock. Keep it on `self._urlopen` (the guarded opener); do not add gdown
   or route around the guard.
+- **Google sync is non-blocking — core caps sync-song at ~250ms.** FeedBack's capability
+  bus (`capabilities.js` `COMMAND_TIMEOUTS_MS`, which omits `library`/`sync-song`) times the
+  sync out at 250ms — far too short for an internet download. So `sync_song` never downloads
+  inline: it returns immediately (a `cacheState: "downloading"` result), runs the download on
+  a background thread, and plays on the *next* click once `_local_ready` finds the file. The
+  screen polls `active_downloads()` via `/downloads` to show "Downloading…" / "Ready to play"
+  toasts (the v3 song page has no per-card sync badge, so a toast is the only visible signal).
+  `query_page` also reports `localFilename` for songs already in the local folder
+  (`_downloaded_names`), so a downloaded song renders as a first-class local card (one-click
+  play, local artwork, working overflow-menu Play). Do not reintroduce a blocking download in
+  `sync_song` — it would silently fail at the 250ms wall.
 - **`.feedpak` is the sloppak family.** `playback_settings_key` treats `.feedpak` like
   `.sloppak`/`.zip` (feedpak == sloppak internally). Part of the client↔core
   playback-settings-key contract above — validate against FeedBack core if feedpak NAM
