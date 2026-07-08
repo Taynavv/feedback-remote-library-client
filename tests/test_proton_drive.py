@@ -347,13 +347,12 @@ def test_proton_crypto_end_to_end(tmp_path):
         # An armored *secret* key (bytes(cert) is public-only), the way Proton ships node keys.
         return ps.armor(bytes(cert.secrets), ps.ArmorKind.SecretKey)
 
-    share = {
+    # The Token object from GET /drive/urls/{token}: share material + the root folder's node keys.
+    material = {
         "SharePasswordSalt": base64.b64encode(salt).decode(),
         "SharePassphrase": armored(ps.encrypt(b"share-pass", passwords=[url_passphrase])),
         "ShareKey": secret_key(share_key),
         "LinkID": "ROOT0000",
-    }
-    root_link = {
         "NodePassphrase": armored(ps.encrypt(b"root-pass", recipients=[share_key])),
         "NodeKey": secret_key(root_key),
     }
@@ -364,22 +363,20 @@ def test_proton_crypto_end_to_end(tmp_path):
         "NodePassphrase": armored(ps.encrypt(b"child-pass", recipients=[root_key])),
         "NodeKey": secret_key(child_key),
         "Name": armored(ps.encrypt(b"Fake_Artist-Fake Title.feedpak", recipients=[child_key])),
-        "ContentKeyPacket": base64.b64encode(content_key_packet).decode(),
+        # The content key rides on the file link's FileProperties, not the revision.
+        "FileProperties": {"ContentKeyPacket": base64.b64encode(content_key_packet).decode()},
     }
     bare_url = "https://storage.example.test/block/0"
 
     class FakeClient:
-        def share(self):
-            return share
-
-        def fetch_root_link(self, link_id):
-            return root_link
+        def bootstrap(self):
+            return material
 
         def fetch_children(self, link_id):
             return [child]
 
         def fetch_file_revision(self, link_id):
-            return {"ContentKeyPacket": child["ContentKeyPacket"], "Blocks": [{"Index": 1, "BareURL": bare_url}]}
+            return {"Blocks": [{"Index": 1, "BareURL": bare_url}]}
 
         def download_block(self, url):
             assert url == bare_url

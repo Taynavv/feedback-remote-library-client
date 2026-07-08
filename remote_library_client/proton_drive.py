@@ -272,16 +272,10 @@ class _ProtonShareClient:
         server_proof = result.get("ServerProof")
         if server_proof and not user.verify_session(base64.b64decode(server_proof)):
             raise RuntimeError("Proton server proof verification failed")
-        share = result.get("Share") or {}
-        if not share:
-            # Fallback: some responses carry the share material under a separate fetch.
-            extra = self._request(f"/drive/urls/{self._token}", authed=False)
-            share = extra.get("Token") or extra.get("Share") or {}
         expires_in = _safe_int(result.get("ExpiresIn"), 600)
         return {
             "uid": result["UID"],
             "access_token": result["AccessToken"],
-            "share": share,
             "expires_at": time.monotonic() + max(60, expires_in - 30),
         }
 
@@ -292,19 +286,17 @@ class _ProtonShareClient:
             self._session = self._authenticate()
             return self._session
 
-    def share(self) -> dict:
-        return self._ensure_session()["share"]
-
-    def fetch_root_link(self, link_id: str) -> dict:
-        last_error: Exception | None = None
-        for path in (f"/drive/urls/{self._token}/folders/{parse.quote(link_id)}",
-                     f"/drive/urls/{self._token}/links/{parse.quote(link_id)}"):
-            try:
-                payload = self._request(path)
-                return payload.get("Link") or payload
-            except RuntimeError as exc:
-                last_error = exc
-        raise last_error or RuntimeError("could not fetch Proton root folder metadata")
+    def bootstrap(self) -> dict:
+        """The share + root-folder crypto material from ``GET /drive/urls/{token}`` -> ``Token``:
+        ``ShareKey`` / ``SharePassphrase`` / ``SharePasswordSalt`` plus the root folder's
+        ``NodeKey`` / ``NodePassphrase`` / ``LinkID`` — everything needed to unwind the hierarchy
+        and list the root folder. (The auth response's ``Share`` carries only the share half.)"""
+        self._ensure_session()
+        payload = self._request(f"/drive/urls/{self._token}")
+        material = payload.get("Token") or payload.get("Share") or payload
+        if not material.get("LinkID"):
+            raise RuntimeError("Proton share bootstrap is missing the root link id")
+        return material
 
     def fetch_children(self, link_id: str, page_size: int = 150) -> list[dict]:
         children: list[dict] = []
@@ -319,11 +311,24 @@ class _ProtonShareClient:
                 break
         return children
 
-    def fetch_file_revision(self, link_id: str, page_size: int = 250) -> dict:
-        payload = self._request(
-            f"/drive/urls/{self._token}/files/{parse.quote(link_id)}?FromBlockIndex=1&PageSize={page_size}"
-        )
-        return payload.get("Revision") or payload
+    def fetch_file_revision(self, link_id: str, page_size: int = 200) -> dict:
+        # Blocks are paginated by FromBlockIndex; walk every page so large files aren't truncated.
+        revision: dict = {}
+        blocks: list[dict] = []
+        from_index = 1
+        while True:
+            payload = self._request(
+                f"/drive/urls/{self._token}/files/{link_id}?FromBlockIndex={from_index}&PageSize={page_size}"
+            )
+            revision = payload.get("Revision") or payload
+            page = revision.get("Blocks") or []
+            blocks.extend(page)
+            if len(page) < page_size:
+                break
+            from_index += len(page)
+        merged = dict(revision)
+        merged["Blocks"] = blocks
+        return merged
 
     def download_block(self, bare_url: str) -> bytes:
         req = request.Request(bare_url, headers={"User-Agent": _USER_AGENT})
@@ -380,18 +385,18 @@ class ProtonPublicShareProvider(BaseLibraryProvider):
     # -- catalog (auth + list + decrypt names) ---------------------------
 
     def _build_catalog(self) -> list[dict]:
-        share = self._client.share()
+        material = self._client.bootstrap()
         url_passphrase = proton_srp.compute_key_password(
-            self._url_password, base64.b64decode(share["SharePasswordSalt"])
+            self._url_password, base64.b64decode(material["SharePasswordSalt"])
         )
-        share_passphrase = _decrypt_password(share["SharePassphrase"], url_passphrase)
-        share_decryptor = _key_decryptor(share["ShareKey"], share_passphrase)
-        link_id = share["LinkID"]
-        root = self._client.fetch_root_link(link_id)
-        root_passphrase = _decrypt_with_key(root["NodePassphrase"], share_decryptor)
-        root_decryptor = _key_decryptor(root["NodeKey"], root_passphrase)
+        share_passphrase = _decrypt_password(material["SharePassphrase"], url_passphrase)
+        share_decryptor = _key_decryptor(material["ShareKey"], share_passphrase)
+        # The root folder's own node passphrase is encrypted to the share key; its node key then
+        # decrypts each child's passphrase.
+        root_passphrase = _decrypt_with_key(material["NodePassphrase"], share_decryptor)
+        root_decryptor = _key_decryptor(material["NodeKey"], root_passphrase)
         records: list[dict] = []
-        for child in self._client.fetch_children(link_id):
+        for child in self._client.fetch_children(material["LinkID"]):
             record = self._decrypt_child(child, root_decryptor)
             if record:
                 records.append(record)
@@ -413,13 +418,16 @@ class ProtonPublicShareProvider(BaseLibraryProvider):
             return None
         if not name.lower().endswith(PACKAGE_SUFFIXES):
             return None
+        # The per-file content key rides on the file link (FileProperties.ContentKeyPacket), not
+        # on the revision fetched at download time — capture it now while decrypting the listing.
+        file_props = child.get("FileProperties") or {}
         return {
             "linkId": str(child.get("LinkID") or ""),
             "name": name,
             "size": _safe_int(child.get("Size"), 0),
             "nodeKey": child["NodeKey"],
             "nodePassphrase": _as_text(child_passphrase),
-            "contentKeyPacket": child.get("ContentKeyPacket") or "",
+            "contentKeyPacket": file_props.get("ContentKeyPacket") or child.get("ContentKeyPacket") or "",
         }
 
     def _catalog_snapshot(self) -> dict:
@@ -696,11 +704,13 @@ class ProtonPublicShareProvider(BaseLibraryProvider):
             fallback_filename += ".feedpak"
         file_decryptor = _key_decryptor(record["nodeKey"], record["nodePassphrase"])
         revision = self._client.fetch_file_revision(song_id)
+        # The content key comes from the file link (captured into the record when listing); the
+        # revision only carries the blocks.
         content_key_packet = _armored_bytes(
-            revision.get("ContentKeyPacket") or record.get("contentKeyPacket") or ""
+            record.get("contentKeyPacket") or revision.get("ContentKeyPacket") or ""
         )
         if not content_key_packet:
-            raise RuntimeError("Proton file revision is missing its content key")
+            raise RuntimeError("Proton file is missing its content key")
         blocks = sorted((revision.get("Blocks") or []), key=lambda block: _safe_int(block.get("Index"), 0))
         if not blocks:
             raise RuntimeError("Proton file revision has no content blocks")
@@ -733,10 +743,12 @@ class ProtonPublicShareProvider(BaseLibraryProvider):
         try:
             with tmp_path.open("wb") as handle:
                 for block in blocks:
-                    bare_url = block.get("BareURL") or block.get("URL")
-                    if not bare_url:
+                    # `URL` is the full block-download URL; `BareURL` is the host+prefix only (a
+                    # bare fetch of it 400s), so prefer `URL` and keep BareURL as a fallback.
+                    block_url = block.get("URL") or block.get("BareURL")
+                    if not block_url:
                         raise RuntimeError("Proton content block is missing its download URL")
-                    encrypted = self._client.download_block(bare_url)
+                    encrypted = self._client.download_block(block_url)
                     plaintext = pysequoia.decrypt(content_key_packet + encrypted, decryptor=file_decryptor).bytes
                     if plaintext is None:
                         raise RuntimeError("Proton content block decryption produced no data")

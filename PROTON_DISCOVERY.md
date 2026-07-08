@@ -16,10 +16,11 @@ on the existing `BaseLibraryProvider` / `PROVIDER_TYPES` seam (same pattern as G
 - **Full metadata decryption works** — recovered real `.feedpak` filenames from the E2EE share
   (`Artist-Title.feedpak` convention on the tested share — note it differs from Google Drive's
   `Artist - Album - Title`, so the Proton parser needs its own filename handling).
-- **Not yet run (blocked by anti-abuse rate-limiting after rapid probing):** decrypting an actual
-  content block + confirming the SEIPD packet version. This is the *same* OpenPGP decryption as the
-  metadata; it only decides whether the old PGPy path could work or `pysequoia` is required (see
-  Dependencies). Do this first when implementing, against a throwaway share.
+- **Content decryption works end to end (verified during the build).** The shipped provider
+  downloaded + decrypted a real song's content blocks against the live share and reassembled a
+  **valid `.feedpak` (a ZIP archive)** — `pysequoia` handles the SEIPD packets. Each block is a bare
+  SEIPD packet (first byte `0xd2` = new-format tag 18); prepending the file's `ContentKeyPacket`
+  (a PKESK) reconstructs a decryptable OpenPGP message.
 
 ## Protocol (anonymous public share)
 
@@ -31,13 +32,20 @@ data endpoints additionally require `x-pm-appversion: web-drive@<ver>` (e.g. `we
 2. `POST /drive/urls/{token}/auth` `{ClientEphemeral, ClientProof, SRPSession}` → **anonymous
    session** `{UID, AccessToken, ServerProof, Share, ...}`. Verify `ServerProof`. Authed calls send
    `x-pm-uid: {UID}` + `Authorization: Bearer {AccessToken}`.
-3. `GET /drive/urls/{token}` → `Token`: the share + **root folder** node material —
-   `{ShareKey, SharePassphrase, SharePasswordSalt, NodeKey, NodePassphrase, NodeHashKey, LinkID}`.
-4. `GET /drive/urls/{token}/folders/{LinkID}/children?Page&PageSize` → files: each
-   `{LinkID, Type, Name (enc), NodeKey, NodePassphrase, Hash (HMAC), Size, MIMEType, ...}`.
-5. `GET /drive/urls/{token}/files/{LinkID}?FromBlockIndex&PageSize` → revision + block manifest
-   (`ContentKeyPacket` + `Blocks[]` each with a `BareURL` on a storage host). *(shape from research;
-   confirm during implementation.)*
+3. `GET /drive/urls/{token}` → `{Token}`: the share **and** root-folder node material together —
+   `{ShareKey, SharePassphrase, SharePasswordSalt, NodeKey, NodePassphrase, NodeHashKey, LinkID, ...}`.
+   **Required** — the auth response's `Share` carries only the share half (`ShareKey`/`SharePassphrase`/
+   `SharePasswordSalt`/`LinkID`), *not* the root `NodeKey`/`NodePassphrase`. (`/folders/{LinkID}` and
+   `/links/{LinkID}` both 404 for a public share — do not use them.)
+4. `GET /drive/urls/{token}/folders/{LinkID}/children?Page&PageSize` → `{Links: [...]}`: each child
+   `{LinkID, Type, Name (enc), NodeKey, NodePassphrase, Hash (HMAC), Size, MIMEType, FileProperties, ...}`.
+   **The per-file content key is `FileProperties.ContentKeyPacket`** (a PKESK), captured here — not on
+   the revision below.
+5. `GET /drive/urls/{token}/files/{LinkID}?FromBlockIndex&PageSize` → the active revision with
+   `Blocks[]` (paginate by `FromBlockIndex`), each block `{Index, URL, BareURL, Hash, Token, ...}`.
+   **Fetch each block from `URL`** (the full storage URL; a bare `BareURL` fetch 400s) — the bytes are a
+   standalone SEIPD packet. Decrypt `ContentKeyPacket ‖ block` with the file node key; reassemble by
+   `Index`.
 
 ## Crypto chain (verified)
 
@@ -87,8 +95,9 @@ blocks. Reuses the type picker, the `BaseLibraryProvider` seam, and the local-im
 
 - **Undocumented, moving API** — `x-pm-appversion` is required and Proton bumps/eventually rejects old
   values; they migrate crypto (SEIPDv2). Standing maintenance/breakage liability.
-- **Anti-abuse rate-limiting** — rapid auth gets throttled (hit during discovery). Cache the session
-  (`AccessToken`, `ExpiresIn`) and back off.
+- **Anti-abuse rate-limiting** — rapid *repeated* auth gets throttled (hit during discovery). Mitigated
+  in the build by caching the session (`AccessToken`/`ExpiresIn`) + the decrypted catalog and reusing the
+  registered provider across status polls; a full auth→list→download run completes cleanly.
 - **Custom-password shares** — the tested share used a generated password; password-protected shares
   concatenate the user-typed password (both the SRP gate and the bcrypt derivation) — handle the flag.
 - **Provenance** — the protocol is reverse-engineered from Proton's GPL-3.0 WebClients (compatible with
