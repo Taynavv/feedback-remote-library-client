@@ -67,7 +67,7 @@
                 : isProton
                     ? 'https://drive.proton.me/urls/…#…'
                     : isIroh
-                        ? "the server's Library ID (endpoint…)"
+                        ? "the server's Library ID (a 64-character key)"
                         : 'https://drive.google.com/drive/folders/…';
         }
     }

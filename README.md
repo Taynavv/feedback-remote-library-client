@@ -9,9 +9,10 @@ Remote Library Client connects [FeedBack](https://github.com/got-feedback/feedBa
 
 > [!CAUTION]
 > **This plugin downloads and imports arbitrary files from whatever server, folder, or share you point it at.**
-> A source you connect to — a Remote Library Server, a Google Drive folder, or a Proton Drive share — fully
-> controls the metadata and, above all, the **package files** this client downloads into your local library
-> and then plays.
+> A source you connect to — a Remote Library Server (by URL or over iroh), a Google Drive folder, or a
+> Proton Drive share — fully controls the metadata and, above all, the **package files** this client
+> downloads into your local library and then plays. Reaching a server over iroh is no safer than by URL:
+> the Library ID authenticates *which* server you reach, not that its files are trustworthy.
 > **Only connect to sources run by people you trust.** Don't add a URL a stranger handed you, and
 > don't download or play content you can't identify. A malicious or compromised source can hand
 > you a hostile file. If you connect to someone sketchy and it costs you — a trojan, junk data,
@@ -36,7 +37,7 @@ The **same Remote Library Server, reached peer-to-peer by ID** — no port forwa
 - **Identity is a public key.** The Library ID is the server's iroh public key (EndpointId) — self-authenticating (connecting to it is cryptographically guaranteed to be that server, stronger than a plain URL) and **stable across restarts**, so a follow you save keeps working. iroh discovery resolves its current network address each time you connect. Set an access token on the server unless you're fine with anyone who has the ID browsing.
 - **Availability = the server is online.** Unlike the cloud-hosted types, this follows a *live* server: when its machine is off, the library is off.
 - **Songs download in the background** the first time you play them (an internet hop can't meet FeedBack's instant-sync budget), then play on the next click — same as the Google Drive / Proton types.
-- Requires the `iroh` dependency (see below); the connection may fall back to a shared relay for hard NATs, which is slower than a direct hole-punched path.
+- Requires the `iroh` dependency ([requirements.txt](requirements.txt), installed by FeedBack on load); the connection may fall back to a shared relay for hard NATs, which is slower than a direct hole-punched path.
 
 ### Public Google Drive folder (`google-drive-public.v1`)
 
@@ -71,17 +72,17 @@ Paste the **whole** share link, including the `#…` password fragment — that 
 Notes and limits:
 
 - The share must be a **public** ("anyone with the link") share, and the link must include its **generated password** (the `#…` fragment). Shares with a separate custom password are not supported yet.
-- This is the one source type with a **native dependency**: Proton's encryption requires `bcrypt` and `pysequoia`, listed in [requirements.txt](requirements.txt) and installed by FeedBack on load. The other two source types have no dependencies, so they keep working even where these can't be installed.
+- Proton has a **native dependency**: its encryption requires `bcrypt` and `pysequoia`, listed in [requirements.txt](requirements.txt) and installed by FeedBack on load. The **direct-server and Google Drive** types have no dependencies, so they keep working even where a native wheel can't be installed. (The iroh type also has a native dependency — the `iroh` wheel.)
 - Proton's public-share API is undocumented and changes over time; if listing suddenly fails, the plugin may need an update.
 
 ## Flow
 
-The **Remote Library Server** type speaks this REST protocol. (The **Google Drive** type has no server — it enumerates a public folder and downloads packages directly; see [Source types](#source-types).)
+Both server-backed types speak this REST protocol: the **Remote Library Server** type over HTTP, and the **Remote Server over iroh** type over the *same* requests tunnelled through an iroh QUIC stream — identical endpoints, identical bearer-token auth, only the transport differs. The **Google Drive** and **Proton Drive** types have no server API — they enumerate a public folder/share and download packages directly (Proton also decrypts them); see [Source types](#source-types).
 
 ```mermaid
 flowchart LR
   UI[FeedBack Library] --> Provider[Remote Library Client provider]
-  Provider -->|"GET /source"| Server[Remote Library Server]
+  Provider -->|"GET /source"| Server["Remote Library Server<br/>(direct URL, or tunnelled over iroh)"]
   Provider -->|"GET /songs?q=...&page=0&pageSize=N"| Server
   Provider -->|"GET /artists"| Server
   Provider -->|"GET /stats"| Server
@@ -116,7 +117,7 @@ NAM tone sync is best-effort and non-fatal: if the server doesn't share tone ass
 
 ## Authentication & security
 
-- **Access tokens.** If a Remote Library Server requires a bearer token, the client prompts for it when you add the source (and shows a **Token required** badge otherwise). Set, change, or clear a token later with the **key** button on the source card. The token is stored locally with the source and sent as `Authorization: Bearer <token>` (or a `?token=` query parameter for non-ASCII tokens, which HTTP headers cannot carry); it is never echoed back to the browser.
+- **Access tokens.** If a Remote Library Server requires a bearer token, the client prompts for it when you add the source (and shows a **Token required** badge otherwise). Set, change, or clear a token later with the **key** button on the source card. The token is stored locally with the source and sent as `Authorization: Bearer <token>` (or a `?token=` query parameter for non-ASCII tokens, which HTTP headers cannot carry); it is never echoed back to the browser. This applies identically to the **iroh** type — the token rides the tunnelled request unchanged, so it protects a server shared over iroh exactly as one reached by URL. (The Library ID authenticates *which* server you reach; the token controls *access* to it.)
 - **Redirect protection.** By default the client refuses to follow a server redirect that pivots to a different internal / loopback host (an SSRF guard). If a trusted server legitimately relies on such a redirect, enable **Allow unsafe redirects** on that source. Only add servers you trust — see [SECURITY.md](SECURITY.md).
 
 ## Development
@@ -156,5 +157,7 @@ a pull request. Small, focused PRs with a description of what was tested are the
 contributing you agree your changes are licensed under the same AGPL-3.0 terms.
 
 ## License
+
+Copyright (C) 2026 Taynavv and contributors.
 
 AGPL-3.0-or-later — see [LICENSE](LICENSE).
