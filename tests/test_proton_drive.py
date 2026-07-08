@@ -71,7 +71,7 @@ class FakeCatalogProvider(ProtonPublicShareProvider):
 @pytest.mark.parametrize(
     "url,expected",
     [
-        ("https://drive.proton.me/urls/GD9ABCDEF1#SecretPass12", ("GD9ABCDEF1", "SecretPass12")),
+        ("https://drive.proton.me/urls/TESTTOKEN01#SecretPass12", ("TESTTOKEN01", "SecretPass12")),
         ("https://drive.proton.me/urls/TOKEN123", ("TOKEN123", "")),
         ("https://drive.google.com/drive/folders/abc", None),
         ("https://studio.local:8765", None),
