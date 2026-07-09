@@ -5,6 +5,15 @@
 Remote Library Client is distributed as tagged releases. Security fixes land on the latest
 release; older tagged builds are not separately patched. Please run the most recent release.
 
+A security fix only protects you once it's installed, so keep the plugin up to date. How you
+update depends on how you installed it (see the README's Install section):
+
+- **A git-clone install updates in place** through FeedBack's plugin manager —
+  **Check for Updates → Update** pulls the latest commit and applies it on the next restart.
+- **A release-zip install is not picked up by "Check for Updates"** — download the newer zip
+  from the [Releases](https://github.com/Taynavv/feedback-remote-library-client/releases) page
+  and replace the plugin folder yourself.
+
 ## Reporting a vulnerability
 
 Report security issues **privately** — do not open a public issue for anything that could

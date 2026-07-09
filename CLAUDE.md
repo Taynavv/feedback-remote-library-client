@@ -162,6 +162,18 @@ end-to-end-encrypted Proton Drive public share of package files.
   direct package-download), return immediately, and play on the next click, exposing
   `active_downloads()` for the `/downloads` poller (the Google Drive / Proton pattern). The screen's
   click handler + poller treat `iroh:` provider ids like `gdrive:` / `proton:`.
+- **An offline iroh server must fail *fast*, not hang — the timeouts are load-bearing.** Dialing a
+  dead/unreachable peer otherwise blocks on iroh discovery for a long internal timeout (the source
+  "just sits there"). `iroh_transport.py` caps the *dial* at `_CONNECT_TIMEOUT` (separate from the
+  120 s `_DEFAULT_TIMEOUT` data-transfer ceiling — a download stays patient, a connect never does),
+  and `_run` bounds every loop call with `asyncio.wait_for` so a timed-out connect is actually
+  *cancelled*, not leaked onto the shared loop. The status `/source` probe uses the short
+  `_STATUS_PROBE_TIMEOUT` via `IrohLibraryProvider.probe_source()`. Any non-HTTP transport failure
+  raises `IrohUnreachableError` (message `IROH_UNREACHABLE_MESSAGE`); `routes.py` `status()` catches
+  it to keep the card `online: False` with that clear `message` (screen.js already renders it), and
+  core browse (`query_page`) fails fast the same way instead of hanging. `open_stream` still re-dials
+  once for a stale cached connection — don't re-add an unbounded/looping re-dial on top, or the
+  offline-server hang comes back.
 
 ## Rules
 

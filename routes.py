@@ -14,6 +14,7 @@ from remote_library_client.google_drive import (
 )
 from remote_library_client.iroh_transport import (
     IrohLibraryProvider,
+    IrohUnreachableError,
     is_iroh_id,
     normalize_iroh_id,
 )
@@ -348,7 +349,9 @@ def _iroh_source(seed: dict) -> dict:
         "allowUnsafeRedirects": False,
         "token": token,
     }
-    payload = _provider_for_source(source)._json("/source", timeout=30)
+    # Use the short status-probe budget (not a long default) so an offline server surfaces promptly
+    # here — on add/refresh and on every /status poll — instead of blocking on iroh discovery.
+    payload = _provider_for_source(source).probe_source()
     capabilities = set(payload.get("capabilities") or [])
     # Validate the handshake: any live iroh endpoint on this ALPN answers, so make sure it's actually
     # a Remote Library Server (not, say, a leftover test peer) — otherwise it silently browses empty.
@@ -472,6 +475,12 @@ def setup(app, context):
                     item["message"] = (
                         "Access token rejected" if str(source.get("token") or "").strip() else "Access token required"
                     )
+                except IrohUnreachableError as exc:
+                    # Offline / unreachable server: keep the card in the Offline state (online stays
+                    # False) with a clear message that screen.js renders, rather than a raw transport
+                    # error or a source that just looks empty.
+                    item["online"] = False
+                    item["message"] = _public_error_message(exc)
                 except Exception as exc:
                     item["message"] = _public_error_message(exc)
                 sources.append(_public_source(item))
