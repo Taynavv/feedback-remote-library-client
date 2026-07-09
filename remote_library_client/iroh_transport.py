@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import http.client
 import io
 import threading
@@ -48,7 +49,26 @@ def _decode_direct_song_id(song_id: str) -> str | None:
         return None
 
 ALPN = b"feedback/rls/1"
+# Timeouts. `_DEFAULT_TIMEOUT` bounds a *data transfer* — a package download may be large and slow.
+# Dialing/discovery, by contrast, must fail fast: reaching an offline or unreachable peer otherwise
+# blocks on discovery for a long internal timeout, which is exactly what made an offline server "just
+# sit there doing nothing". So the dial is capped separately (`_CONNECT_TIMEOUT`), regardless of the
+# caller's overall timeout, and the status UI's health probe caps its whole /source fetch at
+# `_STATUS_PROBE_TIMEOUT` (connect + request + read), so an offline source is reported quickly.
 _DEFAULT_TIMEOUT = 120.0
+_CONNECT_TIMEOUT = 12.0
+_STATUS_PROBE_TIMEOUT = 12.0
+
+IROH_UNREACHABLE_MESSAGE = "Server unreachable over iroh — it may be offline."
+
+
+class IrohUnreachableError(RuntimeError):
+    """The iroh peer could not be reached — the dial/discovery failed or timed out (likely offline).
+
+    Raised by :func:`http_over_iroh` for any non-HTTP transport failure, so every caller (the status
+    probe, core browse, a background download) can report a clear "offline" state promptly instead of
+    hanging and then surfacing a raw transport stack trace.
+    """
 
 
 def _iroh():
@@ -83,7 +103,15 @@ class _IrohRuntime:
         self._lock = threading.Lock()
 
     def _run(self, coro, timeout: float = _DEFAULT_TIMEOUT):
-        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
+        # Bound the coroutine *on the loop* with wait_for, so a timeout actually cancels the pending
+        # work (e.g. a connect to an offline peer stuck on discovery) instead of leaving it running on
+        # the shared loop after the calling thread has given up. result()'s slightly longer wait is a
+        # grace window for wait_for to cancel-and-unwind before we stop waiting on the loop entirely.
+        future = asyncio.run_coroutine_threadsafe(asyncio.wait_for(coro, timeout), self._loop)
+        try:
+            return future.result(timeout + 5)
+        except (asyncio.TimeoutError, concurrent.futures.TimeoutError) as exc:
+            raise TimeoutError(f"iroh operation timed out after {timeout:g}s") from exc
 
     async def _bind(self):
         iroh = _iroh()
@@ -106,7 +134,12 @@ class _IrohRuntime:
             conn = self._conns.get(iroh_id)
         if conn is not None:
             return conn
-        conn = self._run(self._endpoint.connect(self._addr_for(iroh_id), ALPN), timeout=timeout)
+        # Cap the dial regardless of the caller's overall budget: if we can't reach the peer within
+        # `_CONNECT_TIMEOUT` it is effectively offline, and a large data-transfer timeout must never
+        # become a multi-minute wait just to discover the server is gone.
+        conn = self._run(
+            self._endpoint.connect(self._addr_for(iroh_id), ALPN), timeout=min(timeout, _CONNECT_TIMEOUT)
+        )
         with self._lock:
             self._conns[iroh_id] = conn
         return conn
@@ -200,7 +233,8 @@ def http_over_iroh(iroh_id: str, req, timeout: float = _DEFAULT_TIMEOUT):
     """Perform a urllib ``Request`` over iroh and return an ``http.client`` response (which is
     urllib-response-compatible: context manager, ``read``, ``status``, ``headers``). Raises
     ``urllib.error.HTTPError`` on a >=400 status so ``DirectLibraryProvider``'s error handling
-    (401 -> AuthRequiredError, etc.) works unchanged."""
+    (401 -> AuthRequiredError, etc.) works unchanged, and :class:`IrohUnreachableError` when the peer
+    can't be reached at all (dial/discovery failed or timed out)."""
     runtime = _get_runtime()
     parsed = parse.urlparse(req.full_url)
     path = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
@@ -209,24 +243,21 @@ def http_over_iroh(iroh_id: str, req, timeout: float = _DEFAULT_TIMEOUT):
     headers.setdefault("Host", "iroh")
     headers["Connection"] = "close"  # one request/response per stream; server closes after
 
-    def attempt():
-        sock = runtime.open_stream(iroh_id, timeout)
+    try:
+        sock = runtime.open_stream(iroh_id, timeout)  # connect (+1 stale-cache re-dial); see open_stream
         http_conn = http.client.HTTPConnection("iroh")
         http_conn.sock = sock
         http_conn.request(method, path, body=req.data, headers=headers)
         sock.finish_send()  # request fully sent -> EOF so the server flushes it to the app
-        return http_conn.getresponse()
-
-    try:
-        response = attempt()
+        response = http_conn.getresponse()
     except urllib_error.HTTPError:
         raise
-    except Exception:
-        runtime.drop(iroh_id)  # dead cached connection -> re-dial once
-        try:
-            response = attempt()
-        except Exception as exc:
-            raise urllib_error.URLError(f"iroh transport error: {exc}") from exc
+    except Exception as exc:
+        # open_stream already re-dials once for a stale cached connection, so a failure here means we
+        # genuinely couldn't reach or complete over iroh. Report it as unreachable *promptly* (the
+        # connect underneath is bounded by _CONNECT_TIMEOUT) rather than looping on further dials.
+        runtime.drop(iroh_id)
+        raise IrohUnreachableError(IROH_UNREACHABLE_MESSAGE) from exc
 
     if response.status >= 400:
         raise urllib_error.HTTPError(req.full_url, response.status, response.reason, response.headers, response)
@@ -287,6 +318,12 @@ class IrohLibraryProvider(DirectLibraryProvider):
 
     def _urlopen(self, req, timeout=_DEFAULT_TIMEOUT):
         return http_over_iroh(self._iroh_id, req, timeout=timeout)
+
+    def probe_source(self) -> dict:
+        """Read ``/source`` with the short status-probe budget so an offline server is reported
+        promptly instead of hanging the status call. Raises :class:`IrohUnreachableError` when the
+        peer can't be reached and :class:`AuthRequiredError` (via ``_json``) on a 401."""
+        return self._json("/source", timeout=_STATUS_PROBE_TIMEOUT)
 
     # -- non-blocking sync (mirrors google_drive.py / proton_drive.py) ----
 

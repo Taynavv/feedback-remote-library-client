@@ -18,6 +18,27 @@ Remote Library Client connects [FeedBack](https://github.com/got-feedback/feedBa
 > you a hostile file. If you connect to someone sketchy and it costs you — a trojan, junk data,
 > whatever — **that is on you, not on this project.** There is no warranty; you use it at your own risk.
 
+## Install
+
+Remote Library Client is a FeedBack plugin. There are two ways to install it, and the
+choice decides how you get updates:
+
+- **From a release (simplest).** Download the latest
+  `feedback-remote-library-client-<version>.zip` from the
+  [Releases](https://github.com/Taynavv/feedback-remote-library-client/releases) page and
+  extract the `feedback-remote-library-client` folder into your FeedBack user-plugins
+  directory. Updating later means downloading the newer zip and replacing the folder
+  yourself — a zip install is **not** picked up by FeedBack's in-app "Check for Updates".
+- **From a git clone (updatable in-app).** Clone this repository into your FeedBack
+  user-plugins directory (or clone it elsewhere and symlink/junction it in). Because the
+  plugin folder is then a git checkout, FeedBack's plugin manager can update it in place:
+  **Check for Updates → Update** runs a `git pull` and applies on the next restart. Track
+  the default branch and keep the checkout clean, or the fast-forward-only pull is skipped.
+
+Either way, reload FeedBack afterwards — the plugin appears as **Remote Client** in the
+navigation. See the [FeedBack](https://github.com/got-feedback/feedBack) documentation for
+where your instance loads plugins from.
+
 ## Runtime Model
 
 The plugin declares the core `library` capability as a provider. Its manifest uses provider `operations` (`query-page`, `query-artists`, `query-stats`, `tuning-names`, `get-art`, `sync-song`) because configured sources are exposed through FeedBack's native library provider coordinator. Connection management stays on the plugin's existing screen and backend routes; those UI actions are not declared as a separate capability domain.
@@ -98,7 +119,7 @@ flowchart LR
 
 ## Usage
 
-1. Install this client plugin in FeedBack.
+1. Install this client plugin in FeedBack (see [Install](#install)).
 2. Open **Remote Client**, click **+**, and choose a **Source type**:
    - **Google Drive** — paste a public ("anyone with the link") folder link. No server, login, or token required.
    - **Proton Drive** — paste a public share link *including its `#…` password*. No Proton account or login required.

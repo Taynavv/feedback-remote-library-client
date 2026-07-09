@@ -8,6 +8,8 @@ import json
 import socketserver
 import sys
 import threading
+import time
+import types
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -21,6 +23,7 @@ if str(ROOT) not in sys.path:
 
 from remote_library_client.iroh_transport import (  # noqa: E402
     IrohLibraryProvider,
+    IrohUnreachableError,
     _decode_direct_song_id,
     is_iroh_id,
     normalize_iroh_id,
@@ -175,6 +178,78 @@ def test_add_iroh_source_registers_and_hides_token(tmp_path, monkeypatch):
     assert added.json()["provider"]["id"] in registered
 
 
+# ------------------------------------ offline / unreachable handling (no iroh; transport mocked)
+
+
+def test_run_bounds_and_cancels_on_timeout():
+    """``_run`` must return promptly when a coroutine overruns its timeout AND actually cancel the
+    pending work — so a dial to an offline peer can't leak onto the shared loop and wedge later calls.
+    This is the mechanism that turns a would-be hang into a prompt "offline"."""
+    from remote_library_client.iroh_transport import _IrohRuntime
+
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    fake = types.SimpleNamespace(_loop=loop)  # _run only needs self._loop
+    cancelled = threading.Event()
+
+    async def hang():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    try:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            _IrohRuntime._run(fake, hang(), timeout=0.2)
+        assert time.monotonic() - started < 5  # returned promptly, not after the coroutine's 30s
+        assert cancelled.wait(2)  # the coroutine was cancelled, not left running on the loop
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+
+def test_status_reports_unreachable_iroh_source(tmp_path, monkeypatch):
+    """A previously-added iroh source whose server goes offline must show an Offline card with a
+    clear message (screen.js renders `message`), not hang the status call or look normal-but-empty."""
+    routes = importlib.reload(importlib.import_module("routes"))
+    ok_payload = {
+        "ok": True, "sourceId": "studio", "sourceName": "Studio", "songCount": 3,
+        "capabilities": ["library.read", "song.sync"],
+    }
+    # Reachable when first added ...
+    monkeypatch.setattr(
+        IrohLibraryProvider, "_json",
+        lambda self, path, params=None, timeout=20: ok_payload,
+    )
+    app = FastAPI()
+    routes.setup(app, {
+        "config_dir": tmp_path / "config",
+        "register_library_provider": lambda provider, replace=False: None,
+        "get_sloppak_cache_dir": lambda: tmp_path / "cache",
+        "get_dlc_dir": lambda: None,
+    })
+    client = TestClient(app)
+    added = client.post(
+        "/api/plugins/remote_library_client/sources",
+        json={"type": "iroh-library.v1", "baseUrl": FAKE_ID},
+    )
+    assert added.status_code == 200
+
+    # ... then the server goes offline: the /source probe raises IrohUnreachableError.
+    def offline(self, path, params=None, timeout=20):
+        raise IrohUnreachableError("Server unreachable over iroh — it may be offline.")
+
+    monkeypatch.setattr(IrohLibraryProvider, "_json", offline)
+
+    body = client.get("/api/plugins/remote_library_client/status").json()
+    assert body["sources"], "the added source should still be listed"
+    src = body["sources"][0]
+    assert src["online"] is False
+    assert "unreachable" in src["message"].lower()
+    assert "token" not in src  # secrets are still stripped on the offline path
+
+
 # --------------------------------------------- real-iroh loopback integration (gated on iroh)
 
 
@@ -266,3 +341,17 @@ def test_iroh_provider_browses_over_real_iroh(tmp_path):
     assert total == 1
     assert result[0]["title"] == "Kryptonite"
     assert result[0]["libraryProviderId"] == provider.id
+
+
+def test_unreachable_bare_id_fails_fast(tmp_path):
+    """A syntactically valid but unreachable bare EndpointId must raise IrohUnreachableError within a
+    bounded time (the dial is capped at _CONNECT_TIMEOUT) — not hang on discovery for minutes. This is
+    the real end-to-end guard behind the prompt "offline" state."""
+    pytest.importorskip("iroh")
+    from remote_library_client.iroh_transport import _CONNECT_TIMEOUT
+
+    provider = IrohLibraryProvider({"irohId": "b" * 64}, tmp_path)  # valid hex, (almost certainly) no peer
+    started = time.monotonic()
+    with pytest.raises(IrohUnreachableError):
+        provider.probe_source()
+    assert time.monotonic() - started < _CONNECT_TIMEOUT + 15  # bounded, not a 120s hang
