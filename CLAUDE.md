@@ -208,8 +208,14 @@ package files.
   rapid full scrapes).** `query_page` fetches only the FeedForge page(s) covering the requested window
   (`_PAGE_SIZE = 25`/page, 1-indexed, stable + non-overlapping order — verified), mapping core's
   `(page, size)` onto that grid and slicing. **Server-side query params ride along**: `?q=` is a real
-  full-text **search** (verified — returns matching songs), `?sort=` maps via `_SORT_MAP` (only
-  verified-stable sorts; unknown → default order). There is **no total on the page**, so `query_page`
+  full-text **search** (verified — returns matching songs), `?sort=` maps via `_SORT_MAP`. Core's Songs
+  menu sends `artist` / `artist-desc` / `title` / `title-desc` / `recent` / `year-desc` (direction is *in*
+  the string). FeedForge supports only `artist` / `title` / `newest` (its default) / `updated` /
+  `downloads` — **no descending direction and no year sort** (verified), and `downloads` overlaps across
+  pages (unsafe for lazy slicing, omitted). So `_query_params` strips a `-desc` suffix and maps the base
+  field: **Artist/Title A–Z and Recently-Added are faithful; the two Z–A options fall back to the ascending
+  field-sort and Year-newest falls back to `newest`** (best achievable lazily). There is **no total on the
+  page**, so `query_page`
   reports an *at-least* total that grows while full pages keep coming and settles exactly at the last
   (short) page — never triggering the binary search, so browsing stays lazy. The **source-card count**
   (`describe_source` / `query_stats.total_songs`) comes from `_catalog_total()` — a binary search for the

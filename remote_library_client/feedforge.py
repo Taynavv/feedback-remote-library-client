@@ -73,17 +73,20 @@ _MAX_LIBRARY_PAGES = 400
 # FeedForge serves a fixed 25 songs per /library page (verified live). A module constant so
 # tests can monkeypatch a smaller page size to exercise multi-page mapping cheaply.
 _PAGE_SIZE = 25
-# Map FeedBack's sort vocabulary to FeedForge's server-side ?sort= values (verified: the default
-# order and ?sort=artist both paginate stably + non-overlapping). An unmapped sort falls through
-# to FeedForge's default stable order rather than risking an unstable one that breaks paging.
+# Map FeedBack's sort vocabulary to FeedForge's server-side ?sort= values. Core's v3 Songs menu
+# sends: artist / artist-desc / title / title-desc / recent / year-desc (the direction is encoded
+# in the string). FeedForge supports ONLY artist / title / newest (its default order) / updated /
+# downloads, with NO descending direction and NO year sort (all verified live) — and of those only
+# artist/title/newest/updated paginate stably (downloads overlaps across pages → unsafe for lazy
+# slicing, omitted). So `_query_params` strips a "-desc" suffix and maps the base field:
+# descending falls back to the ascending field-sort (FeedForge can't reverse), and year falls back
+# to "newest" (the closest "newest first" intent). An unmapped sort → FeedForge's default order.
 _SORT_MAP = {
     "artist": "artist",
     "title": "title",
-    "newest": "newest",
-    "updated": "updated",
-    "downloads": "downloads",
-    "date": "newest",
     "recent": "newest",
+    "newest": "newest",
+    "year": "newest",
 }
 
 # ---- scrape selectors (verified live against feedforge.org 2026-07-10; adjust if the markup
@@ -368,7 +371,10 @@ class FeedForgeProvider(BaseLibraryProvider):
         q = str(q or "").strip()
         if q:
             params["q"] = q[:200]
-        sort_value = _SORT_MAP.get(str(sort or "").lower())
+        # Core encodes direction in the sort string (e.g. "artist-desc"); FeedForge has no
+        # descending direction, so strip the suffix and sort by the base field (ascending).
+        base_sort = str(sort or "").lower().removesuffix("-desc")
+        sort_value = _SORT_MAP.get(base_sort)
         if sort_value:
             params["sort"] = sort_value
         return params

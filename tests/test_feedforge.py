@@ -329,6 +329,27 @@ def test_query_page_search_passes_q_through_server_side(tmp_path):
     assert any("q=metallica" in path for _m, path in provider.calls)
 
 
+@pytest.mark.parametrize("core_sort,expected", [
+    ("artist", "artist"),
+    ("artist-desc", "artist"),   # FeedForge has no descending direction -> the base field
+    ("title", "title"),
+    ("title-desc", "title"),
+    ("recent", "newest"),
+    ("year-desc", "newest"),     # FeedForge has no year sort -> newest (closest "newest first")
+    ("downloads", None),         # unsafe (overlapping pages) -> unmapped -> default order
+    ("nonsense", None),
+])
+def test_sort_maps_to_supported_feedforge_value(tmp_path, core_sort, expected):
+    provider = FakeFeedForge(tmp_path, catalog=_cards(3))
+    assert provider._query_params(sort=core_sort).get("sort") == expected
+
+
+def test_query_page_passes_mapped_sort_to_server(tmp_path):
+    provider = FakeFeedForge(tmp_path, catalog=_cards(3))
+    provider.query_page(sort="title-desc", size=3)
+    assert any("sort=title" in path for _m, path in provider.calls)
+
+
 def test_query_page_total_settles_at_the_end(tmp_path):
     provider = FakeFeedForge(tmp_path, catalog=_cards(7))
 
