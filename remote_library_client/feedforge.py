@@ -68,22 +68,30 @@ _USER_AGENT = (
 # NextAuth's session cookie (JWT strategy — forced by the credentials provider). Its presence
 # in the jar is our "are we logged in?" signal; it self-renews as the server re-issues it.
 _SESSION_COOKIE = "__Secure-next-auth.session-token"
-# The site is ~5-6 catalog pages today; cap pagination so a markup change can't loop forever.
-_MAX_LIBRARY_PAGES = 60
+# The catalog is a few thousand songs (~60-100 pages of 25) and grows over time; this is a
+# backstop against a runaway loop, set well above the real size — not an expected limit.
+_MAX_LIBRARY_PAGES = 400
 
-# ---- scrape selectors (verified against the live site; adjust if the markup drifts) --------
-# Each browsable song is an <article class="song-card"> carrying an id (a cuid) in a
-# href="/songs/{id}", a `song-title` anchor, an artist <p>, a `song-card-meta` row of spans
-# (tuning, year, duration), and an art <img>.
-_CARD_RE = re.compile(r'<article\b[^>]*\bclass="[^"]*\bsong-card\b[^"]*"[^>]*>(.*?)</article>', re.S | re.I)
-_SONG_ID_RE = re.compile(r'href="/songs/([A-Za-z0-9_-]+)"')
-_TITLE_RE = re.compile(r'\bclass="[^"]*\bsong-title\b[^"]*"[^>]*>(.*?)</a>', re.S | re.I)
-_ARTIST_RE = re.compile(r"<p\b[^>]*>(.*?)</p>", re.S | re.I)
-_META_BLOCK_RE = re.compile(r'\bclass="[^"]*\bsong-card-meta\b[^"]*"[^>]*>(.*?)</div>', re.S | re.I)
-_SPAN_RE = re.compile(r"<span\b[^>]*>(.*?)</span>", re.S | re.I)
-_ART_RE = re.compile(r'<img\b[^>]*\bsrc="([^"]+)"', re.I)
+# ---- scrape selectors (verified live against feedforge.org 2026-07-10; adjust if the markup
+# drifts). The catalog is a <table>: each song is a <tr> with a `song-title` anchor to
+# /songs/{id} and typed `linked-cell` facet anchors whose hrefs carry the value
+# (?artist= / ?album= / ?tuning=). Art is a `cover-thumb` <img> (its /feedpak-covers/{coverId}
+# id differs from the song id). Keying on the href facet — not column position — keeps the parse
+# robust to the table's columns being reordered.
+_ROW_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.S | re.I)
+_TITLE_RE = re.compile(r'class="song-title"[^>]*?href="/songs/([A-Za-z0-9_-]+)"[^>]*>(.*?)</a>', re.S | re.I)
+# Facet cells are <a class="linked-cell" href="/library?…&facet=Value">Value</a>. The facet
+# param can sit anywhere in the query (the order varies — e.g. `?page=1&artist=…`), so match it
+# positionally-independent (`[^"]*\bfacet=`) rather than assuming it follows `?`.
+_ARTIST_RE = re.compile(r'href="/library\?[^"]*\bartist=[^"]*"[^>]*>(.*?)</a>', re.S | re.I)
+_ALBUM_RE = re.compile(r'href="/library\?[^"]*\balbum=[^"]*"[^>]*>(.*?)</a>', re.S | re.I)
+_TUNING_RE = re.compile(r'href="/library\?[^"]*\btuning=[^"]*"[^>]*>(.*?)</a>', re.S | re.I)
+_YEAR_RE = re.compile(r'href="/library\?[^"]*\byear=[^"]*"[^>]*>(.*?)</a>', re.S | re.I)
+# Duration is a plain <td>M:SS</td> (not a link); take the last M:SS in the row (it sits near the
+# end, after Year), so an earlier numeric cell can't be mistaken for it.
+_DURATION_RE = re.compile(r"<td[^>]*>\s*(\d{1,2}:\d{2})\s*</td>", re.I)
+_ART_RE = re.compile(r'class="cover-thumb"[^>]*>\s*<img\b[^>]*\bsrc="([^"]+)"', re.S | re.I)
 _TAG_RE = re.compile(r"<[^>]+>")
-_DURATION_RE = re.compile(r"^\s*(\d{1,2}):([0-5]?\d)\s*$")
 
 
 def _text(raw: str) -> str:
@@ -97,11 +105,8 @@ def _first(pattern: re.Pattern, block: str) -> str:
 
 
 def _duration_seconds(text: str) -> int | None:
-    match = _DURATION_RE.match(str(text or ""))
-    if match:
-        return int(match.group(1)) * 60 + int(match.group(2))
-    value = _safe_int(text, -1)
-    return value if value >= 0 else None
+    match = re.match(r"^\s*(\d{1,2}):([0-5]?\d)\s*$", str(text or ""))
+    return int(match.group(1)) * 60 + int(match.group(2)) if match else None
 
 
 def is_feedforge_url(url: str) -> bool:
@@ -132,33 +137,47 @@ def normalize_feedforge_base_url(url: str) -> str:
     return f"{parsed.scheme}://{host}{port}"
 
 
-def parse_library_html(text: str) -> list[dict]:
-    """Parse the server-rendered ``/library`` HTML into a list of card dicts.
+def _direct_download_url(url: str) -> str:
+    """Coerce a resolved share link to its direct-download form. FeedForge indexes external
+    hosts; Dropbox share links serve an HTML *preview* at ``?dl=0`` and stream the file only at
+    ``?dl=1``, so force that. Google Drive is handled separately (confirm-token flow); everything
+    else is returned unchanged."""
+    parsed = parse.urlparse(str(url or ""))
+    host = (parsed.hostname or "").lower()
+    if host == "dropbox.com" or host.endswith(".dropbox.com"):
+        query = [(key, value) for key, value in parse.parse_qsl(parsed.query, keep_blank_values=True) if key != "dl"]
+        query.append(("dl", "1"))
+        return parse.urlunparse(parsed._replace(query=parse.urlencode(query)))
+    return url
 
-    Best-effort and tolerant: a card missing a song id is skipped; any missing field degrades
-    to an empty/None value rather than raising. Kept a module function (not a method) so tests
-    can exercise the parser directly on synthetic HTML.
+
+def parse_library_html(text: str) -> list[dict]:
+    """Parse the server-rendered ``/library`` table into a list of card dicts.
+
+    Best-effort and tolerant: a row without a ``song-title`` anchor (e.g. the header row) is
+    skipped; any missing facet degrades to an empty value rather than raising. Kept a module
+    function (not a method) so tests can exercise the parser directly on synthetic HTML.
     """
     cards: list[dict] = []
     seen: set[str] = set()
-    for block in _CARD_RE.findall(text or ""):
-        id_match = _SONG_ID_RE.search(block)
-        if not id_match:
+    for row in _ROW_RE.findall(text or ""):
+        title_match = _TITLE_RE.search(row)
+        if not title_match:
             continue
-        song_id = id_match.group(1)
+        song_id = title_match.group(1)
         if song_id in seen:
             continue
         seen.add(song_id)
-        meta_block = _META_BLOCK_RE.search(block)
-        spans = [_text(span) for span in _SPAN_RE.findall(meta_block.group(1))] if meta_block else []
-        art_match = _ART_RE.search(block)
+        art_match = _ART_RE.search(row)
+        durations = _DURATION_RE.findall(row)
         cards.append({
             "song_id": song_id,
-            "title": _first(_TITLE_RE, block) or song_id,
-            "artist": _first(_ARTIST_RE, block) or "Unknown artist",
-            "tuning": spans[0] if len(spans) > 0 else "",
-            "year": _safe_int(spans[1], 0) if len(spans) > 1 else 0,
-            "duration": _duration_seconds(spans[2]) if len(spans) > 2 else None,
+            "title": _text(title_match.group(2)) or song_id,
+            "artist": _first(_ARTIST_RE, row) or "Unknown artist",
+            "album": _first(_ALBUM_RE, row),
+            "tuning": _first(_TUNING_RE, row),
+            "year": _safe_int(_first(_YEAR_RE, row), 0),
+            "duration": _duration_seconds(durations[-1]) if durations else None,
             "art": html.unescape(art_match.group(1)) if art_match else "",
         })
     return cards
@@ -168,6 +187,15 @@ class FeedForgeProvider(BaseLibraryProvider):
     """Library provider backed by a FeedForge account (username/password login)."""
 
     type = "feedforge.v1"
+    # The full-catalog scrape spans many pages (~25s for a few thousand songs). Cache it far
+    # longer than the base 5 min so, with the provider reused across status polls, there is
+    # only ~one scrape per this interval — repeated rapid scrapes trip Cloudflare rate-limiting.
+    metadata_cache_ttl_seconds = 900
+    # A page can transiently come back empty under that rate-limiting; retry an empty page a few
+    # times with backoff before treating it as the end of the catalog, so a blip doesn't
+    # silently truncate the scrape. (Tests set the backoff to 0.)
+    empty_page_retries = 3
+    empty_page_backoff_seconds = 0.6
 
     def __init__(
         self,
@@ -308,28 +336,42 @@ class FeedForgeProvider(BaseLibraryProvider):
     # -- catalog ---------------------------------------------------------
 
     def _fetch_all_cards(self) -> list[dict]:
+        # The default /library order is stable and pages don't overlap (verified live), so the
+        # catalog is the concatenation of pages until an empty one. But a page can *transiently*
+        # come back empty (a Cloudflare/render hiccup) — which previously truncated the catalog
+        # mid-scrape — so _fetch_page_cards retries an empty page once before we treat it as the
+        # true end.
         cards: list[dict] = []
         seen: set[str] = set()
         for page in range(1, _MAX_LIBRARY_PAGES + 1):
+            page_cards = self._fetch_page_cards(page)
+            if not page_cards:
+                break  # confirmed end of catalog (empty even after a retry)
+            fresh = [card for card in page_cards if card["song_id"] not in seen]
+            if not fresh:
+                break  # a full page of only already-seen songs => pagination looped; stop
+            for card in fresh:
+                seen.add(card["song_id"])
+            cards.extend(fresh)
+        return cards
+
+    def _fetch_page_cards(self, page: int) -> list[dict]:
+        """One catalog page's cards, retrying an empty/errored result a few times with backoff so
+        a transient empty page (a Cloudflare rate-limit blip) doesn't prematurely end the scrape.
+        Returns ``[]`` only when the page stays empty across all attempts (the true end of the
+        catalog). A lapsed session still raises."""
+        for attempt in range(self.empty_page_retries):
             try:
                 page_cards = parse_library_html(self._authed_html(f"/library?page={page}"))
             except AuthRequiredError:
                 raise  # a lapsed/invalid session must surface, not look like an empty catalog
             except Exception:
-                # A page past the end may 404/err (we don't know the out-of-range behavior);
-                # once we already have songs, treat that as the end rather than failing.
-                if cards:
-                    break
-                raise
-            fresh = [card for card in page_cards if card["song_id"] not in seen]
-            for card in fresh:
-                seen.add(card["song_id"])
-            cards.extend(fresh)
-            # Stop at an empty page, or one that added nothing new (the site clamps an
-            # out-of-range ?page back to the last page, which would otherwise loop).
-            if not page_cards or not fresh:
-                break
-        return cards
+                page_cards = []
+            if page_cards:
+                return page_cards
+            if attempt + 1 < self.empty_page_retries and self.empty_page_backoff_seconds:
+                time.sleep(self.empty_page_backoff_seconds * (attempt + 1))
+        return []
 
     def _entries(self) -> list[dict]:
         key = self._metadata_cache_key("catalog", {"base": self.base_url, "user": self.username})
@@ -381,7 +423,7 @@ class FeedForgeProvider(BaseLibraryProvider):
             "sourceName": self.label,
             "title": card.get("title") or song_id,
             "artist": card.get("artist") or "Unknown artist",
-            "album": "",
+            "album": card.get("album") or "",
             "year": year,
             "duration": card.get("duration"),
             "format": "sloppak",
@@ -419,6 +461,7 @@ class FeedForgeProvider(BaseLibraryProvider):
             song for song in songs
             if needle in song["title"].lower()
             or needle in song["artist"].lower()
+            or needle in (song["album"] or "").lower()
             or needle in (song["tuning"] or "").lower()
         ]
 
@@ -449,12 +492,15 @@ class FeedForgeProvider(BaseLibraryProvider):
         page = max(0, _safe_int(page, 0))
         artists = []
         for name in artist_names[page * size:page * size + size]:
-            songs_for_artist = by_artist[name]
+            by_album: "OrderedDict[str, list[dict]]" = OrderedDict()
+            for song in by_artist[name]:
+                by_album.setdefault(song["album"], []).append(song)
+            albums = [{"name": album, "song_count": len(items), "songs": items} for album, items in by_album.items()]
             artists.append({
                 "name": name,
-                "album_count": 1,
-                "song_count": len(songs_for_artist),
-                "albums": [{"name": "", "song_count": len(songs_for_artist), "songs": songs_for_artist}],
+                "album_count": len(albums),
+                "song_count": len(by_artist[name]),
+                "albums": albums,
             })
         return artists, total
 
@@ -559,8 +605,9 @@ class FeedForgeProvider(BaseLibraryProvider):
                 self, file_id, remote_name, self._download_headers()
             )
         else:
+            # Non-Drive host (e.g. Dropbox) — coerce to a direct-download URL, then stream.
             target, content_hash, bytes_read, _headers = self._download_url_to_cache(
-                url, remote_name, self._download_headers()
+                _direct_download_url(url), remote_name, self._download_headers()
             )
         self.clear_metadata_cache()
         result = {

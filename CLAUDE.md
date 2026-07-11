@@ -195,20 +195,33 @@ package files.
   needlessly and risk Cloudflare/anti-abuse throttling. App API routes (the download POST) authorize on
   the session cookie + `X-Requested-With: fetch` only — **no CSRF token** (CSRF is only on the NextAuth
   sign-in calls).
-- **Listing is HTML scraping — the `song-card` selectors are the fragile part.** There is no JSON list
-  API (`/api/songs` etc. 404); `query_page`/`artists`/`stats` are served from the full catalog scraped
-  out of `/library?page=N` (`parse_library_html`, paginated until an empty/repeat page, cached with the
-  metadata TTL). A vibe-coded markup change can break the parse unannounced (same class as the Google
-  folder scraper) — the selector regexes are constants at the top of `feedforge.py`; adjust them if the
-  live HTML drifts. Verify against a live authed page; tests use synthetic fixtures only.
-- **FeedForge hosts nothing — download is resolve-then-fetch, reusing the Drive path.** `sync_song` is
-  non-blocking (same ~250 ms core cap and background machinery as Google/Proton; the screen's click
-  handler + `/downloads` poller treat `feedforge:` ids like `gdrive:`). `_do_sync` POSTs
-  `/api/songs/{id}/download` → `{ok, url}` (an external link, typically Google Drive) and, when the URL
-  is a Drive file, calls `google_drive.download_drive_file` (shared module function — the confirm-token
-  flow lives in one place now). It **imports under the deterministic `Artist - Title.feedpak` name**
-  (not the CDN's Content-Disposition) so the browse-time `settingsKey` matches core's key for the
-  imported file (the client↔core playback-settings-key contract).
+- **Listing is a scraped `<table>` — the row/facet selectors are the fragile part (verified live
+  2026-07-10).** There is no JSON list API (`/api/songs` etc. 404); `query_page`/`artists`/`stats` are
+  served from the full catalog scraped out of `/library?page=N` (25 songs/page). Each song is a `<tr>`
+  with a `song-title` anchor to `/songs/{id}` and typed `linked-cell` **facet** anchors whose hrefs
+  carry the value — `href="/library?…&artist=…"` / `&album=` / `&tuning=` / `&year=` (the param sits
+  *after* `?page=N`, not right after `?`, so `parse_library_html` matches `[^"]*\bfacet=`, not `\?facet=`);
+  duration is a plain `<td>M:SS</td>`; cover art is a `cover-thumb` `<img>` whose `/feedpak-covers/{id}`
+  differs from the song id. A vibe-coded markup change breaks the parse unannounced — the selector regexes
+  are constants at the top of `feedforge.py`. Verify against a live authed page; tests use synthetic
+  fixtures only. **The default order is stable + non-overlapping**, so the catalog is pages concatenated
+  until an empty one — but **Cloudflare rate-limits repeated rapid full scrapes**, returning transient
+  empty pages that would silently truncate the catalog. Mitigations: `_fetch_page_cards` retries an empty
+  page (`empty_page_retries`, backoff) before treating it as the end; the catalog is cached
+  `metadata_cache_ttl_seconds = 900` and the provider is reused across polls (so ~one scrape per 15 min).
+  A single cold scrape gets the whole catalog (~2000 songs, ~25s); heavy repeated access can still
+  truncate. **The real fix for a large/growing catalog is lazy per-page pagination** (fetch only the
+  viewed page — far fewer requests, no throttle) — the eager full-scrape is a known limitation.
+- **FeedForge hosts nothing — download is resolve-then-fetch, reusing the Drive path + a Dropbox
+  fixup.** `sync_song` is non-blocking (same ~250 ms core cap and background machinery as Google/Proton;
+  the screen's click handler + `/downloads` poller treat `feedforge:` ids like `gdrive:`). `_do_sync`
+  POSTs `/api/songs/{id}/download` → `{ok, url}` (an external link — **Google Drive *or* Dropbox** in the
+  wild). A Drive file → `google_drive.download_drive_file` (shared module function; the confirm-token flow
+  lives in one place now); everything else → `_download_url_to_cache` after `_direct_download_url` coerces
+  a Dropbox share link's `?dl=0` (an HTML *preview*) to `?dl=1` (the real file, which 302s to
+  `dl.dropboxusercontent.com` — a public host the SSRF guard allows). It **imports under the deterministic
+  `Artist - Title.feedpak` name** (not the CDN's Content-Disposition) so the browse-time `settingsKey`
+  matches core's key for the imported file (the client↔core playback-settings-key contract).
 
 ## Rules
 

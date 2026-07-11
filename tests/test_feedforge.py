@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from remote_library_client.feedforge import (
     FeedForgeProvider,
+    _direct_download_url,
     is_feedforge_url,
     normalize_feedforge_base_url,
     parse_library_html,
@@ -24,30 +25,46 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Synthetic, content-free fixtures: fake cuid ids + obviously-fake names, never a real song
-# or a real FeedForge account. The scrape markup mirrors the reverse-engineered card shape.
+# Synthetic, content-free fixtures mirroring the real feedforge.org /library *table* (verified
+# live 2026-07-10): each song is a <tr> with facet links (?artist= / ?album= / ?tuning= / ?year=,
+# the param appearing after ?page=N) and a plain <td> duration. Obviously-fake ids/names — never
+# a real song or account.
 FAKE_CARDS = [
-    ("cfake000000000000000000b", "Song Bravo", "Zeta Testers", "Drop D", "2021", "3:45"),
-    ("cfake000000000000000000a", "Song Alpha", "Alpha Testers", "E Standard", "2019", "2:58"),
-    ("cfake000000000000000000c", "Song &amp; Charlie", "Alpha Testers", "", "", ""),
+    # (song_id, title, artist, album, tuning, year, duration)
+    ("cfake000000000000000000b", "Song Bravo", "Zeta Testers", "Fake Album Two", "Drop D", "2021", "3:45"),
+    ("cfake000000000000000000a", "Song Alpha", "Alpha Testers", "Fake Album One", "E Standard", "2019", "2:58"),
+    ("cfake000000000000000000c", "Song &amp; Charlie", "Alpha Testers", "", "", "", ""),
 ]
 
 
-def _card_html(song_id, title, artist, tuning, year, duration):
-    spans = "".join(f"<span>{value}</span>" for value in (tuning, year, duration) if value != "" or True)
+def _facet(param, value):
+    if not value:
+        return '<span class="muted">-</span>'
+    return f'<a class="linked-cell" href="/library?page=1&amp;{param}={parse.quote_plus(value)}">{value}</a>'
+
+
+def _row_html(song_id, title, artist, album, tuning, year, duration):
     return (
-        f'<article class="song-card">'
-        f'<a class="song-card-art" href="/songs/{song_id}"><img src="/art/{song_id}.png"></a>'
-        f'<a class="song-title" href="/songs/{song_id}">{title}</a>'
-        f"<p>{artist}</p>"
-        f'<div class="song-card-meta">{spans}</div>'
-        f"</article>"
+        "<tr>"
+        '<td><span class="download-button-wrap"><button class="download-icon-button"></button></span></td>'
+        f'<td><a class="cover-thumb" href="/songs/{song_id}"><img src="/feedpak-covers/{song_id}cover?dpl=x"/></a></td>'
+        f'<td>{_facet("artist", artist)}</td>'
+        f'<td><a class="song-title" href="/songs/{song_id}">{title}</a></td>'
+        f'<td class="album-cell">{_facet("album", album)}</td>'
+        f'<td>{_facet("tuning", tuning)}</td>'
+        f'<td>{_facet("year", year)}</td>'
+        f"<td>{duration or '-'}</td>"
+        "</tr>"
     )
 
 
 def _library_html(cards):
-    body = "".join(_card_html(*card) for card in cards)
-    return f'<html><body><main class="library">{body}</main></body></html>'
+    header = (
+        "<thead><tr><th>Art</th><th>Artist</th><th>Title</th><th>Album</th>"
+        "<th>Tuning</th><th>Year</th><th>Duration</th></tr></thead>"
+    )
+    body = "".join(_row_html(*card) for card in cards)
+    return f'<html><body><table class="library-table">{header}<tbody>{body}</tbody></table></body></html>'
 
 
 def _session_cookie():
@@ -90,6 +107,7 @@ class FakeFeedForge(FeedForgeProvider):
             {"baseUrl": "https://feedforge.org", "username": "tester", "password": "pw", "label": "Fake FeedForge"},
             cache_dir, **kwargs,
         )
+        self.empty_page_backoff_seconds = 0  # no real sleeping in tests
         self._pages = pages or {}
         self._session_valid = session_valid
         self._download_payload = download_payload if download_payload is not None else {}
@@ -174,15 +192,20 @@ def test_parse_library_html_extracts_card_fields():
     bravo = cards[0]
     assert bravo["title"] == "Song Bravo"
     assert bravo["artist"] == "Zeta Testers"
+    assert bravo["album"] == "Fake Album Two"
     assert bravo["tuning"] == "Drop D"
     assert bravo["year"] == 2021
     assert bravo["duration"] == 3 * 60 + 45  # "3:45" -> seconds
-    # HTML entity unescaped; empty meta degrades without raising.
+    # HTML entity unescaped; missing facets (artist present, album/tuning absent) degrade cleanly.
     assert cards[2]["title"] == "Song & Charlie"
+    assert cards[2]["artist"] == "Alpha Testers"
+    assert cards[2]["album"] == ""
+    assert cards[2]["duration"] is None
 
 
-def test_parse_library_html_skips_cards_without_song_id():
-    html = '<article class="song-card"><a class="song-title">Orphan</a></article>' + _card_html(*FAKE_CARDS[0])
+def test_parse_library_html_skips_rows_without_song_title():
+    # The <thead> row and any non-song row (no `song-title` anchor) are skipped.
+    html = "<table><tbody><tr><td>not a song row</td></tr>" + _row_html(*FAKE_CARDS[0]) + "</tbody></table>"
     cards = parse_library_html(html)
     assert len(cards) == 1
     assert cards[0]["song_id"] == "cfake000000000000000000b"
@@ -255,8 +278,8 @@ def test_catalog_paginates_until_empty_page(tmp_path):
     _songs, total = provider.query_page(size=50)
 
     assert total == 3
-    library_fetches = [path for _method, path in provider.calls if path.startswith("/library")]
-    assert len(library_fetches) == 3  # page 1, page 2, empty page 3 -> stop
+    pages = sorted({int(path.split("page=")[1]) for _m, path in provider.calls if path.startswith("/library")})
+    assert pages == [1, 2, 3]  # reached the empty page 3 and stopped (never fetched page 4)
 
 
 def test_catalog_stops_gracefully_when_page_past_end_errors(tmp_path):
@@ -274,6 +297,22 @@ def test_catalog_stops_gracefully_when_page_past_end_errors(tmp_path):
     provider._authed_html = flaky
     _songs, total = provider.query_page(size=50)
     assert total == 3
+
+
+def test_catalog_retries_a_transient_empty_page(tmp_path):
+    # A page that momentarily returns empty must NOT truncate the catalog: retry, then continue.
+    provider = FakeFeedForge(tmp_path)
+    seq = iter([
+        _library_html(FAKE_CARDS[:1]),    # page 1
+        "",                                # page 2, attempt 1: transient empty
+        _library_html(FAKE_CARDS[1:2]),   # page 2, attempt 2 (retry): real content
+        "", "", "",                        # page 3: empty on all retries -> end of catalog
+    ])
+    provider._authed_html = lambda _path: next(seq)
+
+    _songs, total = provider.query_page(size=50)
+
+    assert total == 2  # both songs recovered despite the transient empty page
 
 
 def test_query_stats_and_artists(tmp_path):
@@ -296,10 +335,10 @@ def test_catalog_is_cached(tmp_path):
     provider.query_stats()
     provider.query_artists(size=50)
 
-    # One catalog scrape (page 1 with cards + the empty page 2 that signals the end), then
-    # query_stats / query_artists are served from the metadata TTL cache — no re-scrape.
-    library_fetches = [path for _method, path in provider.calls if path.startswith("/library")]
-    assert len(library_fetches) == 2
+    # One catalog scrape (page 1 with cards + the terminal empty page 2), then query_stats /
+    # query_artists are served from the metadata TTL cache — no re-scrape.
+    pages = sorted({int(path.split("page=")[1]) for _m, path in provider.calls if path.startswith("/library")})
+    assert pages == [1, 2]
 
 
 def test_authed_html_relogs_in_on_logout_redirect(tmp_path):
@@ -366,6 +405,36 @@ def test_do_sync_handles_non_drive_url(tmp_path):
     assert result["ok"] is True
     assert result["playbackSource"] == "remote-cache"  # no local root -> cached only
     assert result["bytes"] > 0
+
+
+@pytest.mark.parametrize("url,expect_dl1", [
+    ("https://www.dropbox.com/scl/fi/abc/Song.feedpak?rlkey=k&st=s&dl=0", True),
+    ("https://www.dropbox.com/scl/fi/abc/Song.feedpak?rlkey=k", True),
+    ("https://drive.google.com/file/d/FID12345678/view", False),
+    ("https://example.com/x.feedpak", False),
+])
+def test_direct_download_url_forces_dropbox_dl1(url, expect_dl1):
+    out = _direct_download_url(url)
+    if expect_dl1:
+        assert "dl=1" in out and "dl=0" not in out
+    else:
+        assert out == url  # non-Dropbox passes through unchanged
+
+
+def test_do_sync_downloads_dropbox_url(tmp_path):
+    # FeedForge songs are often hosted on Dropbox; the share link (?dl=0) must be fetched as its
+    # direct-download form (?dl=1).
+    provider = FakeFeedForge(
+        tmp_path / "cache",
+        pages={1: _library_html([FAKE_CARDS[0]])},
+        download_payload={"ok": True, "url": "https://www.dropbox.com/scl/fi/x/Song.feedpak?rlkey=k&dl=0"},
+    )
+
+    result = provider._do_sync("cfake000000000000000000b")
+
+    assert result["ok"] is True
+    assert result["bytes"] > 0
+    assert any("dl=1" in path for _method, path in provider.calls)  # fetched the direct form
 
 
 def test_do_sync_raises_when_no_download_url(tmp_path):
@@ -455,6 +524,7 @@ def _stub_network(monkeypatch, *, cards=FAKE_CARDS, raise_auth=False):
         return _library_html(cards) if "page=1" in path else _library_html([])
     monkeypatch.setattr(FeedForgeProvider, "_ensure_session", lambda self: None)
     monkeypatch.setattr(FeedForgeProvider, "_authed_html", fake_authed_html)
+    monkeypatch.setattr(FeedForgeProvider, "empty_page_backoff_seconds", 0)  # no real sleeping
 
 
 def test_add_feedforge_source_registers_and_hides_password(tmp_path, monkeypatch):
