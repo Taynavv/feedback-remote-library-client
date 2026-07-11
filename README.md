@@ -1,16 +1,17 @@
 # Remote Library Client
 
-Remote Library Client connects [FeedBack](https://github.com/got-feedback/feedBack) to one or more remote libraries. Each configured source is registered as a FeedBack library provider, so it appears in the core Library source selector. Four source types are supported:
+Remote Library Client connects [FeedBack](https://github.com/got-feedback/feedBack) to one or more remote libraries. Each configured source is registered as a FeedBack library provider, so it appears in the core Library source selector. Five source types are supported:
 
 - **Remote Library Server** — a [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server) URL speaking the full metadata/search/artwork/NAM-tone protocol.
 - **Remote Server over iroh** — the *same* Remote Library Server, reached **peer-to-peer by a Library ID** with no port forwarding. Paste the ID the server shows and its songs appear in FeedBack. See [Source types](#source-types).
+- **FeedForge account** — a [FeedForge](https://feedforge.org) community-catalog account. Enter your username and password and its catalog appears in FeedBack, with server-side search. See [Source types](#source-types).
 - **Public Google Drive folder** — a public ("anyone with the link") Google Drive folder of package files; paste the folder link and its songs show up in FeedBack. See [Source types](#source-types).
 - **Public Proton Drive share** — an anonymous, end-to-end-encrypted Proton Drive share of package files; paste the share link (with its password) and its songs show up in FeedBack. See [Source types](#source-types).
 
 > [!CAUTION]
 > **This plugin downloads and imports arbitrary files from whatever server, folder, or share you point it at.**
-> A source you connect to — a Remote Library Server (by URL or over iroh), a Google Drive folder, or a
-> Proton Drive share — fully controls the metadata and, above all, the **package files** this client
+> A source you connect to — a Remote Library Server (by URL or over iroh), a FeedForge account, a Google
+> Drive folder, or a Proton Drive share — fully controls the metadata and, above all, the **package files** this client
 > downloads into your local library and then plays. Reaching a server over iroh is no safer than by URL:
 > the Library ID authenticates *which* server you reach, not that its files are trustworthy.
 > **Only connect to sources run by people you trust.** Don't add a URL a stranger handed you, and
@@ -45,7 +46,7 @@ The plugin declares the core `library` capability as a provider. Its manifest us
 
 ## Source types
 
-Every source implements the same FeedBack library-provider interface; the types differ only in how they reach the remote library and how much metadata it exposes. You choose the type when adding a source (**+ → Source type**), and the form adapts — the Access token field only appears for a Remote Library Server.
+Every source implements the same FeedBack library-provider interface; the types differ only in how they reach the remote library and how much metadata it exposes. You choose the type when adding a source (**+ → Source type**), and the form adapts — the Access token field only appears for a Remote Library Server, and the FeedForge type shows username + password fields instead.
 
 ### Remote Library Server (`slopsmith-direct-library.v1`)
 
@@ -96,6 +97,25 @@ Notes and limits:
 - Proton has a **native dependency**: its encryption requires `bcrypt` and `pysequoia`, listed in [requirements.txt](requirements.txt) and installed by FeedBack on load. The **direct-server and Google Drive** types have no dependencies, so they keep working even where a native wheel can't be installed. (The iroh type also has a native dependency — the `iroh` wheel.)
 - Proton's public-share API is undocumented and changes over time; if listing suddenly fails, the plugin may need an update.
 
+### FeedForge account (`feedforge.v1`)
+
+A [FeedForge](https://feedforge.org) ("FeedForge Hub") community-catalog **account**. Choose **FeedForge** in the type picker and enter your **username and password** (the URL is optional and defaults to `feedforge.org`), and the client:
+
+- **logs in** to your FeedForge account with its standard username/password sign-in, and keeps the session alive across use;
+- **browses the catalog** — the song list with real title / artist / album / tuning / year / duration and cover art, plus **server-side full-text search**. Browsing is lazy (only the page you're viewing is fetched), so even a multi-thousand-song catalog loads quickly;
+- **downloads** a song into your local library the first time you play it. FeedForge hosts nothing itself — each song resolves to an external link (a Google Drive or Dropbox file), which the client fetches in the background (exactly like the Google Drive / Proton types).
+
+Your **password** is stored locally with the source and stripped from every response (like an access token); only the username is shown. No FeedForge API key is required — there isn't one.
+
+**Playing a song** works exactly like the Google Drive type: the first click on a not-yet-downloaded song shows a **"Downloading…"** notification, then **"Ready to play"** when it lands; click again to play. Already-downloaded songs play on the first click.
+
+Notes and limits:
+
+- **Username/password accounts only.** Discord-login accounts are not supported by this build — a Discord session can't be automated without a real browser, and the clean fix needs a capability FeedBack core doesn't expose to plugins yet.
+- The catalog is read by **scraping the website** (FeedForge has no public API), so a site redesign can break listing until the plugin is updated — the same class of fragility as the Google Drive folder type.
+- **Sort is partial.** Artist A–Z, Title A–Z, and Recently-Added work; FeedForge itself has no descending or year sort, so "Artist Z–A", "Title Z–A", and "Year (newest)" fall back to the closest ascending field. The **A–Z letter rail and browse-by-artist are disabled** (they'd require reading the whole catalog, which the lazy design avoids) — the song list plus search is the browse path.
+- No extra dependency — like the Google Drive type, it runs on the standard stdlib HTTP stack.
+
 ## Flow
 
 Both server-backed types speak this REST protocol: the **Remote Library Server** type over HTTP, and the **Remote Server over iroh** type over the *same* requests tunnelled through an iroh QUIC stream — identical endpoints, identical bearer-token auth, only the transport differs. The **Google Drive** and **Proton Drive** types have no server API — they enumerate a public folder/share and download packages directly (Proton also decrypts them); see [Source types](#source-types).
@@ -121,6 +141,7 @@ flowchart LR
 
 1. Install this client plugin in FeedBack (see [Install](#install)).
 2. Open **Remote Client**, click **+**, and choose a **Source type**:
+   - **FeedForge** — enter your feedforge.org **username and password** (the URL defaults to feedforge.org; no API key needed).
    - **Google Drive** — paste a public ("anyone with the link") folder link. No server, login, or token required.
    - **Proton Drive** — paste a public share link *including its `#…` password*. No Proton account or login required.
    - **Remote Server over iroh** — paste the **Library ID** the server shows under its “Share over iroh” panel (plus an access token if it set one). No URL, no port forwarding.
