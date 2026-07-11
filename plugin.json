@@ -10,14 +10,14 @@
   "script": "screen.js",
   "routes": "routes.py",
   "category": "tools",
-  "description": "Browse and play shared remote libraries — a Remote Library Server (by URL or peer-to-peer over iroh), a public Google Drive folder, or a public Proton Drive share.",
+  "description": "Browse and play shared remote libraries — a Remote Library Server (by URL or peer-to-peer over iroh), a FeedForge account, a public Google Drive folder, or a public Proton Drive share.",
   "icon": "assets/thumb.svg",
   "standards": ["capability-pipelines.v1", "plugin-runtime-idempotent.v1"],
   "capabilities": {
     "library": {
       "roles": ["provider"],
       "operations": ["query-page", "query-artists", "query-stats", "tuning-names", "get-art", "sync-song"],
-      "description": "Registers remote libraries — a Remote Library Server (by URL or peer-to-peer over iroh), a public Google Drive folder, or a public Proton Drive share — as browsable FeedBack library providers with remote metadata, artwork, and song sync.",
+      "description": "Registers remote libraries — a Remote Library Server (by URL or peer-to-peer over iroh), a FeedForge account, a public Google Drive folder, or a public Proton Drive share — as browsable FeedBack library providers with remote metadata, artwork, and song sync.",
       "mode": "active",
       "compatibility": "none",
       "ownership": "multi-provider",

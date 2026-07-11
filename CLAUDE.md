@@ -3,11 +3,12 @@
 Remote Library Client is a [FeedBack](https://github.com/got-feedback/feedBack)
 plugin (id `remote_library_client`) that registers remote libraries as native FeedBack
 **library providers**, so a remote library shows up in the core Library source selector
-and its songs can be browsed, synced, and played locally. Four source **types** are
+and its songs can be browsed, synced, and played locally. Five source **types** are
 supported: a [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server)
 URL (the rich REST protocol), the **same server reached peer-to-peer over iroh** by a Library ID
-(no port forwarding), a public Google Drive folder of package files, and an anonymous
-end-to-end-encrypted Proton Drive public share of package files.
+(no port forwarding), a **FeedForge** (feedforge.org) community-catalog account, a public Google
+Drive folder of package files, and an anonymous end-to-end-encrypted Proton Drive public share of
+package files.
 
 ## Architecture
 
@@ -15,12 +16,13 @@ end-to-end-encrypted Proton Drive public share of package files.
 |---|---|
 | [routes.py](routes.py) | `setup(app, context)`: connection management (add / remove / list sources, health probe), a `PROVIDER_TYPES` registry that dispatches each source on its stored `type` (default = direct server; Google Drive folder URLs auto-detected), and wiring providers into FeedBack's library provider coordinator; resolves the local package cache via the `get_sloppak_cache_dir` context callback |
 | [remote_library_client/provider.py](remote_library_client/provider.py) | `BaseLibraryProvider` (shared transport / cache / library-import machinery + graceful-default `get-art` / `tuning-names`) and `DirectLibraryProvider` — the Remote Library Server implementation (`query-page` / `query-artists` / `query-stats` / `tuning-names` / `get-art` / `sync-song`, package download + NAM-tone asset sync) |
-| [remote_library_client/google_drive.py](remote_library_client/google_drive.py) | `GoogleDrivePublicFolderProvider` — the `google-drive-public.v1` type: enumerate a public Drive folder, parse `Artist - Album - Title.feedpak` filenames for metadata, download packages (redirect + confirm-token flow) into the local cache |
+| [remote_library_client/google_drive.py](remote_library_client/google_drive.py) | `GoogleDrivePublicFolderProvider` — the `google-drive-public.v1` type: enumerate a public Drive folder, parse `Artist - Album - Title.feedpak` filenames for metadata, download packages (redirect + confirm-token flow) into the local cache. Also exposes the Drive download as module functions (`drive_file_id_from_url`, `confirmed_download_url`, `download_drive_file`) reused by the FeedForge type |
+| [remote_library_client/feedforge.py](remote_library_client/feedforge.py) | `FeedForgeProvider` — the `feedforge.v1` type: a FeedForge (feedforge.org) account as a provider. Drives the NextAuth **credentials** login (username + password, auto-relogin on lapse), scrapes the `/library` catalog HTML for rich metadata (title/artist/tuning/year/duration/art), and resolves each song's external download URL (`POST /api/songs/{id}/download` → `{ok,url}`, typically a Google Drive link → reuses `google_drive.py`'s Drive download path). Stdlib only (no new dependency); non-blocking background sync like Google/Proton. **Username/password only — Discord login is not supported by this plugin-only build** |
 | [remote_library_client/proton_drive.py](remote_library_client/proton_drive.py) | `ProtonPublicShareProvider` — the `proton-public.v1` type: anonymous SRP auth to a Proton public share, decrypt the OpenPGP key hierarchy + folder listing (`pysequoia`), parse `Artist-Title.feedpak` filenames, download + decrypt content blocks into the local cache. Needs `bcrypt` + `pysequoia` (see `requirements.txt`) |
 | [remote_library_client/proton_srp.py](remote_library_client/proton_srp.py) | Dependency-light reimplementation of Proton's SRP-6a handshake + bcrypt key-stretch, so the plugin needs only `bcrypt` (not the full `proton-client`, which drags in gpg/openssl/requests). Cross-checked against `proton-client` in tests |
 | [remote_library_client/iroh_transport.py](remote_library_client/iroh_transport.py) | `IrohLibraryProvider` — the `iroh-library.v1` type: the **same Remote Library Server protocol tunnelled over an iroh P2P QUIC stream**, reached by a pasted Library ID (EndpointId). Subclasses `DirectLibraryProvider` and overrides only `_urlopen` (HTTP-over-iroh via a socket adapter + a shared background asyncio runtime); adds a non-blocking background sync. Needs `iroh` (see `requirements.txt`, lazy-imported) |
 | [remote_library_client/store.py](remote_library_client/store.py) | Persisted list of configured sources + per-source options (including `type`) |
-| [screen.html](screen.html) / [screen.js](screen.js) | Remote Client screen: add a server URL, iroh Library ID, Drive folder link, or Proton share link, per-source NAM-tone toggle, status; Google Drive + Proton sources hide the token/NAM/redirect controls (the direct server shows all; the iroh type shows token + NAM but not redirect) |
+| [screen.html](screen.html) / [screen.js](screen.js) | Remote Client screen: add a server URL, iroh Library ID, FeedForge account, Drive folder link, or Proton share link, per-source NAM-tone toggle, status; Google Drive + Proton sources hide the token/NAM/redirect controls (the direct server shows all; the iroh type shows token + NAM but not redirect); the FeedForge type swaps the token field for a username + password pair and makes the URL optional (defaults to feedforge.org) |
 | [settings.html](settings.html) | Settings surface |
 | [tests/](tests) | pytest, content-free: fake servers, fake Drive folders, synthetic Proton key hierarchies + synthetic packages |
 
@@ -174,6 +176,39 @@ end-to-end-encrypted Proton Drive public share of package files.
   core browse (`query_page`) fails fast the same way instead of hanging. `open_stream` still re-dials
   once for a stale cached connection — don't re-add an unbounded/looping re-dial on top, or the
   offline-server hang comes back.
+- **FeedForge is scrape + NextAuth-credentials, username/password only (this build).** `feedforge.v1`
+  drives the NextAuth login (`GET /api/auth/csrf` → form-POST `/api/auth/callback/credentials`
+  `{csrfToken, username, password, callbackUrl, json:true}` → session cookie captured by the shared
+  `BaseLibraryProvider` cookie jar), confirmed via `GET /api/auth/session` returning a `user` (bad
+  creds still 200 but set no session). **Discord login is deliberately out of scope**: it can't be
+  automated safely (self-botting) and the clean path — capture the session from a real browser — needs
+  a FeedBack *core* capability to open a login window that plugins don't have today. Don't add a
+  headless-browser dep or a Discord-token flow to work around it.
+- **The FeedForge account `password` is a secret; the `username` is not.** Stored per source and
+  stripped from every API response by `_public_source` (alongside the server `token` and Proton
+  `urlPassword`); the UI only sees `hasPassword`. The `username` is kept (shown in the card). Keep the
+  password out of responses and logs.
+- **The session self-renews — don't force a re-login each poll.** NextAuth uses the JWT strategy here
+  (forced by the presence of the credentials provider), so the cookie slides (server re-issues it on
+  use). Like Proton, `_save_checked_feedforge_source` **reuses the already-registered provider** so its
+  live session + scraped catalog survive across status polls; rebuilding it every poll would re-login
+  needlessly and risk Cloudflare/anti-abuse throttling. App API routes (the download POST) authorize on
+  the session cookie + `X-Requested-With: fetch` only — **no CSRF token** (CSRF is only on the NextAuth
+  sign-in calls).
+- **Listing is HTML scraping — the `song-card` selectors are the fragile part.** There is no JSON list
+  API (`/api/songs` etc. 404); `query_page`/`artists`/`stats` are served from the full catalog scraped
+  out of `/library?page=N` (`parse_library_html`, paginated until an empty/repeat page, cached with the
+  metadata TTL). A vibe-coded markup change can break the parse unannounced (same class as the Google
+  folder scraper) — the selector regexes are constants at the top of `feedforge.py`; adjust them if the
+  live HTML drifts. Verify against a live authed page; tests use synthetic fixtures only.
+- **FeedForge hosts nothing — download is resolve-then-fetch, reusing the Drive path.** `sync_song` is
+  non-blocking (same ~250 ms core cap and background machinery as Google/Proton; the screen's click
+  handler + `/downloads` poller treat `feedforge:` ids like `gdrive:`). `_do_sync` POSTs
+  `/api/songs/{id}/download` → `{ok, url}` (an external link, typically Google Drive) and, when the URL
+  is a Drive file, calls `google_drive.download_drive_file` (shared module function — the confirm-token
+  flow lives in one place now). It **imports under the deterministic `Artist - Title.feedpak` name**
+  (not the CDN's Content-Disposition) so the browse-time `settingsKey` matches core's key for the
+  imported file (the client↔core playback-settings-key contract).
 
 ## Rules
 

@@ -50,25 +50,39 @@
     // Per-type add form: the Access token field only applies to a Remote Library Server, so
     // hide it (and re-label the URL field) for Google Drive / Proton Drive. Proton's password
     // travels inside the share link itself (the #fragment), so it needs no separate field.
+    // FeedForge instead needs a username + password (credentials login), and its URL is optional
+    // (defaults to feedforge.org).
     function applyTypeUI() {
         const type = selectedSourceType();
         const isDirect = type === 'slopsmith-direct-library.v1';
         const isProton = type === 'proton-public.v1';
         const isIroh = type === 'iroh-library.v1';
+        const isFeedforge = type === 'feedforge.v1';
         const tokenRow = document.getElementById('rlc-token-row');
         // iroh speaks the same protocol as the direct server, so it uses the same optional token.
         if (tokenRow) tokenRow.classList.toggle('hidden', !(isDirect || isIroh));
+        const credentialsRow = document.getElementById('rlc-credentials-row');
+        if (credentialsRow) credentialsRow.classList.toggle('hidden', !isFeedforge);
         const urlLabel = document.getElementById('rlc-base-url-label');
-        if (urlLabel) urlLabel.textContent = isDirect ? 'Server URL' : isProton ? 'Proton share link' : isIroh ? 'Library ID' : 'Google Drive folder link';
+        if (urlLabel) urlLabel.textContent = isDirect ? 'Server URL'
+            : isProton ? 'Proton share link'
+            : isIroh ? 'Library ID'
+            : isFeedforge ? 'FeedForge URL (optional)'
+            : 'Google Drive folder link';
         const urlInput = document.getElementById('rlc-base-url');
         if (urlInput) {
+            // FeedForge defaults to feedforge.org, so its URL field is optional; every other
+            // type needs the URL/ID, so keep native "required" validation on for them.
+            urlInput.required = !isFeedforge;
             urlInput.placeholder = isDirect
                 ? 'studio.local or http://192.168.1.x:8765'
                 : isProton
                     ? 'https://drive.proton.me/urls/…#…'
                     : isIroh
                         ? "the server's Library ID (a 64-character key)"
-                        : 'https://drive.google.com/drive/folders/…';
+                        : isFeedforge
+                            ? 'https://feedforge.org (default)'
+                            : 'https://drive.google.com/drive/folders/…';
         }
     }
 
@@ -89,9 +103,13 @@
         const baseUrl = document.getElementById('rlc-base-url');
         const label = document.getElementById('rlc-label');
         const token = document.getElementById('rlc-token');
+        const username = document.getElementById('rlc-username');
+        const password = document.getElementById('rlc-password');
         if (baseUrl) baseUrl.value = '';
         if (label) label.value = '';
         if (token) token.value = '';
+        if (username) username.value = '';
+        if (password) password.value = '';
     }
 
     function normalizeBaseUrl(value) {
@@ -302,7 +320,7 @@
         const node = document.getElementById('remote-library-client-sources');
         if (!node) return;
         if (!state.sources.length) {
-            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No remote sources yet. Click + to add a public Google Drive folder, a Proton Drive share link, or a Remote Library Server (by URL, or over iroh by its Library ID).</div>';
+            node.innerHTML = '<div class="rounded-xl border border-gray-800/50 bg-dark-700/30 px-4 py-6 text-sm text-gray-400">No remote sources yet. Click + to add a FeedForge account, a public Google Drive folder, a Proton Drive share link, or a Remote Library Server (by URL, or over iroh by its Library ID).</div>';
             return;
         }
         node.innerHTML = state.sources.map(source => {
@@ -322,7 +340,9 @@
                     ? '<span class="rounded-full border border-violet-500/30 bg-violet-500/10 px-2 py-0.5 text-violet-300">Proton Drive</span>'
                     : isIroh
                         ? '<span class="rounded-full border border-teal-500/30 bg-teal-500/10 px-2 py-0.5 text-teal-300">iroh · P2P</span>'
-                        : '';
+                        : sourceType === 'feedforge.v1'
+                            ? '<span class="rounded-full border border-orange-500/30 bg-orange-500/10 px-2 py-0.5 text-orange-300">FeedForge</span>'
+                            : '';
             const toggleLabel = busyMode === 'toggle'
                 ? 'Saving source state'
                 : enabled ? 'Disable source' : 'Enable source';
@@ -399,31 +419,44 @@
         const type = selectedSourceType();
         const isDirect = type === 'slopsmith-direct-library.v1';
         const isIroh = type === 'iroh-library.v1';
+        const isFeedforge = type === 'feedforge.v1';
         const baseUrl = normalizeBaseUrl(document.getElementById('rlc-base-url')?.value || '');
         const label = document.getElementById('rlc-label')?.value.trim() || '';
         const token = (isDirect || isIroh) ? (document.getElementById('rlc-token')?.value.trim() || '') : '';
-        if (!baseUrl) throw new Error(isDirect
-            ? 'Enter a server URL or hostname (for example: studio.local).'
-            : type === 'proton-public.v1'
-                ? 'Paste the full Proton share link, including the password after #.'
-                : isIroh
-                    ? "Paste the server's Library ID (from its “Share over iroh” panel)."
-                    : 'Paste a public Google Drive folder link.');
+        const username = isFeedforge ? (document.getElementById('rlc-username')?.value.trim() || '') : '';
+        const password = isFeedforge ? (document.getElementById('rlc-password')?.value || '') : '';
+        if (isFeedforge) {
+            if (!username || !password) throw new Error('Enter your FeedForge username and password.');
+        } else if (!baseUrl) {
+            throw new Error(isDirect
+                ? 'Enter a server URL or hostname (for example: studio.local).'
+                : type === 'proton-public.v1'
+                    ? 'Paste the full Proton share link, including the password after #.'
+                    : isIroh
+                        ? "Paste the server's Library ID (from its “Share over iroh” panel)."
+                        : 'Paste a public Google Drive folder link.');
+        }
         if (state.adding) return;
         setBusyState({ adding: true });
         setMessage('Adding source...', 'neutral');
         try {
             const body = { type, baseUrl, label };
             if ((isDirect || isIroh) && token) body.token = token;
+            if (isFeedforge) { body.username = username; body.password = password; }
             let result;
             try {
                 result = await api('/sources', { method: 'POST', body: JSON.stringify(body) });
             } catch (error) {
                 if (error.status !== 401) throw error;
-                setMessage(token
-                    ? 'The access token was rejected. Check it and click Add again.'
-                    : 'This server requires an access token. Enter it in the Access token field and click Add again.', 'error');
-                document.getElementById('rlc-token')?.focus();
+                if (isFeedforge) {
+                    setMessage('FeedForge rejected that username or password. Check them and click Add again.', 'error');
+                    document.getElementById('rlc-password')?.focus();
+                } else {
+                    setMessage(token
+                        ? 'The access token was rejected. Check it and click Add again.'
+                        : 'This server requires an access token. Enter it in the Access token field and click Add again.', 'error');
+                    document.getElementById('rlc-token')?.focus();
+                }
                 return;
             }
             const added = result?.source || { baseUrl, label: label || baseUrl, online: false, songCount: 0 };
@@ -659,7 +692,8 @@
             try { providerId = decodeURIComponent(card.getAttribute('data-library-provider') || ''); } catch (error) { return; }
             const isProton = providerId.startsWith('proton:');
             const isIroh = providerId.startsWith('iroh:');
-            if (!providerId.startsWith('gdrive:') && !isProton && !isIroh) return;
+            const isFeedforge = providerId.startsWith('feedforge:');
+            if (!providerId.startsWith('gdrive:') && !isProton && !isIroh && !isFeedforge) return;
             let songId = '';
             try { songId = decodeURIComponent(card.getAttribute('data-library-song') || ''); } catch (error) { songId = ''; }
             // Instant "downloading" toast — the v3 song page has no per-card sync badge, so a
@@ -668,7 +702,7 @@
             const key = `${providerId} ${songId}`;
             if (songId && state.downloadSeen[key] !== 'downloading') {
                 state.downloadSeen[key] = 'downloading';
-                notifyDownloading(isProton ? 'Proton Drive' : isIroh ? 'the iroh server' : 'Google Drive');
+                notifyDownloading(isProton ? 'Proton Drive' : isIroh ? 'the iroh server' : isFeedforge ? 'FeedForge' : 'Google Drive');
             }
             ensureDownloadPolling();
         });

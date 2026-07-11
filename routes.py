@@ -7,6 +7,11 @@ from urllib import parse
 
 from fastapi import HTTPException
 
+from remote_library_client.feedforge import (
+    FeedForgeProvider,
+    is_feedforge_url,
+    normalize_feedforge_base_url,
+)
 from remote_library_client.google_drive import (
     GoogleDrivePublicFolderProvider,
     is_google_drive_folder_url,
@@ -52,6 +57,7 @@ PROVIDER_TYPES = {
     GoogleDrivePublicFolderProvider.type: GoogleDrivePublicFolderProvider,
     ProtonPublicShareProvider.type: ProtonPublicShareProvider,
     IrohLibraryProvider.type: IrohLibraryProvider,
+    FeedForgeProvider.type: FeedForgeProvider,
 }
 
 
@@ -385,6 +391,65 @@ def _save_checked_iroh_source(source: dict) -> dict:
     }
 
 
+def _feedforge_source(seed: dict, provider: BaseLibraryProvider | None = None) -> dict:
+    """Build (or refresh) a FeedForge source: normalize the base URL, then log in + scrape the
+    catalog to validate the credentials and count songs. The ``password`` is a secret — stored
+    per source and stripped from every API response by ``_public_source`` (the ``username`` is
+    not secret and is kept).
+
+    Pass an already-registered ``provider`` to reuse its logged-in session — re-authenticating
+    on every status poll would be wasteful and risk Cloudflare/anti-abuse throttling (the same
+    reason the Proton path reuses its provider)."""
+    base_url = normalize_feedforge_base_url(seed.get("baseUrl") or "")
+    username = str(seed.get("username") or "").strip()
+    password = str(seed.get("password") or "")
+    if not username or not password:
+        raise ValueError("FeedForge needs a username and password")
+    host = parse.urlparse(base_url).hostname or "feedforge.org"
+    source = {
+        **seed,
+        "type": FeedForgeProvider.type,
+        "baseUrl": base_url,
+        "username": username,
+        "password": password,
+        "providerId": seed.get("providerId")
+        or provider_id_for_source(f"feedforge_{host}_{username}", base_url, prefix="feedforge"),
+        "enabled": _source_enabled(seed),
+        "syncNamToneAssets": False,
+        "allowUnsafeRedirects": bool(seed.get("allowUnsafeRedirects")),
+        "token": "",
+    }
+    info = (provider or _provider_for_source(source)).describe_source()
+    label = str(seed.get("label") or "").strip()
+    source.update({
+        "sourceId": info["sourceId"],
+        "sourceName": info["sourceName"],
+        "label": label or seed.get("label") or info["sourceName"],
+        "protocol": FeedForgeProvider.type,
+        "songCount": _safe_int(info.get("songCount"), 0),
+        "remoteCapabilities": list(info.get("capabilities") or []),
+        "namToneSyncAvailable": False,
+        "authRequired": False,
+        "lastSuccessfulContactAt": _utc_now_iso(),
+    })
+    return source
+
+
+def _save_checked_feedforge_source(source: dict) -> dict:
+    # Reuse the registered provider (and its live NextAuth session) when present; only build +
+    # register a fresh one when the source is not yet registered (first add or after restart).
+    existing = _providers.get(source.get("providerId") or "")
+    updated = _feedforge_source(source, provider=existing)
+    provider = existing or _register_source_provider(updated, replace=True)
+    _store.upsert_source(updated)
+    return {
+        **updated,
+        "registered": bool(provider and provider.id in _providers),
+        "online": True,
+        "message": "",
+    }
+
+
 def _provider_payload(provider: BaseLibraryProvider | None) -> dict | None:
     if not provider:
         return None
@@ -392,10 +457,12 @@ def _provider_payload(provider: BaseLibraryProvider | None) -> dict | None:
 
 
 def _public_source(source: dict) -> dict:
-    # Never echo stored secrets back to the browser: the Remote Library Server bearer `token`
-    # and the Proton share `urlPassword` (the URL fragment). Expose only whether a token is set.
-    public = {key: value for key, value in source.items() if key not in ("token", "urlPassword")}
+    # Never echo stored secrets back to the browser: the Remote Library Server bearer `token`,
+    # the Proton share `urlPassword` (the URL fragment), and the FeedForge account `password`.
+    # Expose only whether each is set (the FeedForge `username` is not a secret and is kept).
+    public = {key: value for key, value in source.items() if key not in ("token", "urlPassword", "password")}
     public["hasToken"] = bool(str(source.get("token") or "").strip())
+    public["hasPassword"] = bool(str(source.get("password") or "").strip())
     return public
 
 
@@ -485,6 +552,16 @@ def setup(app, context):
                     item["message"] = _public_error_message(exc)
                 sources.append(_public_source(item))
                 continue
+            if _source_type(source) == FeedForgeProvider.type:
+                try:
+                    item.update(_save_checked_feedforge_source(source))
+                except AuthRequiredError:
+                    item["authRequired"] = True
+                    item["message"] = "Username or password rejected"
+                except Exception as exc:
+                    item["message"] = _public_error_message(exc)
+                sources.append(_public_source(item))
+                continue
             try:
                 payload = _probe_source(source.get("baseUrl") or "", source.get("token") or "")
                 item.update(_save_checked_source(source, payload))
@@ -552,6 +629,22 @@ def setup(app, context):
                 raise HTTPException(status_code=401, detail=message) from exc
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
+        use_feedforge = source_type == FeedForgeProvider.type or (not source_type and is_feedforge_url(raw_url))
+        if use_feedforge:
+            try:
+                source = _feedforge_source({
+                    "baseUrl": raw_url,  # empty -> defaults to https://feedforge.org
+                    "username": str(data.get("username") or "").strip(),
+                    "password": str(data.get("password") or ""),
+                    "label": str(data.get("label") or "").strip(),
+                })
+                provider = _register_source_provider(source, replace=True)
+                _store.upsert_source(source)
+                return {"ok": True, "source": _public_source(source), "provider": _provider_payload(provider)}
+            except AuthRequiredError as exc:
+                raise HTTPException(status_code=401, detail=_public_error_message(exc)) from exc
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
         token = str(data.get("token") or "").strip()
         try:
             base_url, payload = _probe_first_available(raw_url, token)
@@ -601,6 +694,15 @@ def setup(app, context):
             except AuthRequiredError as exc:
                 message = "Access token rejected" if str(source.get("token") or "").strip() else "Access token required"
                 raise HTTPException(status_code=401, detail=message) from exc
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
+        if _source_type(source) == FeedForgeProvider.type:
+            try:
+                updated = _save_checked_feedforge_source(source)
+                provider = _providers.get(updated.get("providerId") or "")
+                return {"ok": True, "source": _public_source(updated), "provider": _provider_payload(provider)}
+            except AuthRequiredError as exc:
+                raise HTTPException(status_code=401, detail=_public_error_message(exc)) from exc
             except Exception as exc:
                 raise HTTPException(status_code=400, detail=_public_error_message(exc)) from exc
         try:

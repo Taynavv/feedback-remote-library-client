@@ -98,6 +98,78 @@ def parse_feedpak_filename(filename: str) -> tuple[str, str, str]:
     return "Unknown artist", "", stem or str(filename or "")
 
 
+_DRIVE_FILE_ID_RE = re.compile(r"/file/d/([A-Za-z0-9_-]{10,})")
+
+
+def drive_file_id_from_url(url: str) -> str | None:
+    """Extract a Google Drive *file* id from a share/download URL, or ``None`` if the URL is
+    not a Drive file link. Used to route a resolved download (e.g. a FeedForge song's external
+    link) through the Drive download path below."""
+    raw = str(url or "").strip()
+    host = (parse.urlparse(raw).hostname or "").lower()
+    if host not in GOOGLE_DRIVE_HOSTS:
+        return None
+    match = _DRIVE_FILE_ID_RE.search(raw)
+    if match:
+        return match.group(1)
+    match = re.search(r"[?&]id=([A-Za-z0-9_-]{10,})", raw)
+    if match:
+        return match.group(1)
+    return None
+
+
+def is_google_drive_file_url(url: str) -> bool:
+    """True when the input is a Google Drive *file* download/share link (not a folder)."""
+    return drive_file_id_from_url(url) is not None
+
+
+def confirmed_download_url(html_text: str, file_id: str) -> str:
+    """Resolve the post-interstitial download URL for a large Drive file.
+
+    Google serves a "can't scan for viruses" HTML page for big files; the real bytes come from
+    a confirm form. Prefer the form's own action + hidden inputs; fall back to the documented
+    ``usercontent`` URL with ``confirm=t``. Shared by the Google Drive folder provider and any
+    other type that resolves to a Drive link (e.g. FeedForge)."""
+    lowered = html_text.lower()
+    if "download quota" in lowered or "too many users have" in lowered:
+        raise RuntimeError(
+            "Google has temporarily rate-limited this file (too many recent downloads); try again later"
+        )
+    action = re.search(r'id="download-form"[^>]+action="([^"]+)"', html_text) or re.search(
+        r'<form[^>]+action="([^"]+)"', html_text
+    )
+    if action:
+        fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', html_text))
+        if fields:
+            base = html.unescape(action.group(1))
+            query = parse.urlencode({key: html.unescape(value) for key, value in fields.items()})
+            return f"{base}?{query}" if query else base
+    return f"https://drive.usercontent.google.com/download?id={parse.quote(file_id)}&export=download&confirm=t"
+
+
+def download_drive_file(
+    provider: BaseLibraryProvider, file_id: str, fallback_filename: str, headers: dict | None = None
+) -> tuple[Path, str, int, dict]:
+    """Download a Google Drive file by id into ``provider``'s cache, handling the large-file
+    virus-scan interstitial. Operates on any :class:`BaseLibraryProvider` (its guarded opener +
+    size-capped streaming), so both the Drive folder provider and the FeedForge provider reuse
+    one copy of the confirm-token flow."""
+    request_headers = headers or {"User-Agent": _USER_AGENT}
+    url = f"https://drive.google.com/uc?export=download&id={parse.quote(file_id)}"
+    req = request.Request(url, headers=request_headers)
+    try:
+        with provider._urlopen(req, timeout=120) as response:
+            content_type = (response.headers.get("content-type") or "").lower()
+            if "text/html" not in content_type:
+                # Common case: Google redirected straight to the file bytes.
+                return provider._stream_response_to_cache(response, fallback_filename)
+            html_text = _read_limited(response, MAX_JSON_RESPONSE_BYTES).decode("utf-8", errors="replace")
+    except error.HTTPError as exc:
+        raise _remote_error(exc) from exc
+    confirmed = confirmed_download_url(html_text, file_id)
+    return provider._download_url_to_cache(confirmed, fallback_filename, request_headers)
+
+
 class GoogleDrivePublicFolderProvider(BaseLibraryProvider):
     """Library provider backed by a public Google Drive folder of package files."""
 
@@ -326,43 +398,11 @@ class GoogleDrivePublicFolderProvider(BaseLibraryProvider):
     # -- download + sync -------------------------------------------------
 
     def _confirmed_download_url(self, html_text: str, file_id: str) -> str:
-        """Resolve the post-interstitial download URL for a large file.
-
-        Google serves a "can't scan for viruses" HTML page for big files; the real bytes
-        come from a confirm form. Prefer the form's own action + hidden inputs; fall back
-        to the documented ``usercontent`` URL with ``confirm=t``.
-        """
-        lowered = html_text.lower()
-        if "download quota" in lowered or "too many users have" in lowered:
-            raise RuntimeError(
-                "Google has temporarily rate-limited this file (too many recent downloads); try again later"
-            )
-        action = re.search(r'id="download-form"[^>]+action="([^"]+)"', html_text) or re.search(
-            r'<form[^>]+action="([^"]+)"', html_text
-        )
-        if action:
-            fields = dict(re.findall(r'<input type="hidden" name="([^"]+)" value="([^"]*)"', html_text))
-            if fields:
-                base = html.unescape(action.group(1))
-                query = parse.urlencode({key: html.unescape(value) for key, value in fields.items()})
-                return f"{base}?{query}" if query else base
-        return f"https://drive.usercontent.google.com/download?id={parse.quote(file_id)}&export=download&confirm=t"
+        # Kept as a thin method (tests target it); the logic is shared at module scope.
+        return confirmed_download_url(html_text, file_id)
 
     def _download_drive_file(self, file_id: str, fallback_filename: str) -> tuple[Path, str, int, dict]:
-        url = f"https://drive.google.com/uc?export=download&id={parse.quote(file_id)}"
-        req = request.Request(url, headers=self._headers())
-        try:
-            with self._urlopen(req, timeout=120) as response:
-                content_type = (response.headers.get("content-type") or "").lower()
-                if "text/html" not in content_type:
-                    # Common case: Google redirected straight to the file bytes.
-                    return self._stream_response_to_cache(response, fallback_filename)
-                html_text = _read_limited(response, MAX_JSON_RESPONSE_BYTES).decode("utf-8", errors="replace")
-        except error.HTTPError as exc:
-            raise _remote_error(exc) from exc
-        # Large-file interstitial: resolve the confirmed URL and stream that.
-        confirmed = self._confirmed_download_url(html_text, file_id)
-        return self._download_url_to_cache(confirmed, fallback_filename, self._headers())
+        return download_drive_file(self, file_id, fallback_filename, self._headers())
 
     def _download_label(self, song_id: str, entry: dict | None = None) -> str:
         entry = entry or self._entry_by_id(song_id)
