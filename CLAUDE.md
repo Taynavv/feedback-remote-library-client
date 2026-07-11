@@ -196,22 +196,30 @@ package files.
   the session cookie + `X-Requested-With: fetch` only — **no CSRF token** (CSRF is only on the NextAuth
   sign-in calls).
 - **Listing is a scraped `<table>` — the row/facet selectors are the fragile part (verified live
-  2026-07-10).** There is no JSON list API (`/api/songs` etc. 404); `query_page`/`artists`/`stats` are
-  served from the full catalog scraped out of `/library?page=N` (25 songs/page). Each song is a `<tr>`
-  with a `song-title` anchor to `/songs/{id}` and typed `linked-cell` **facet** anchors whose hrefs
-  carry the value — `href="/library?…&artist=…"` / `&album=` / `&tuning=` / `&year=` (the param sits
-  *after* `?page=N`, not right after `?`, so `parse_library_html` matches `[^"]*\bfacet=`, not `\?facet=`);
+  2026-07-10).** There is no JSON list API (`/api/songs` etc. 404). Each song is a `<tr>` with a
+  `song-title` anchor to `/songs/{id}` and typed `linked-cell` **facet** anchors whose hrefs carry the
+  value — `href="/library?…&artist=…"` / `&album=` / `&tuning=` / `&year=` (the param sits *after*
+  `?page=N`, not right after `?`, so `parse_library_html` matches `[^"]*\bfacet=`, not `\?facet=`);
   duration is a plain `<td>M:SS</td>`; cover art is a `cover-thumb` `<img>` whose `/feedpak-covers/{id}`
   differs from the song id. A vibe-coded markup change breaks the parse unannounced — the selector regexes
   are constants at the top of `feedforge.py`. Verify against a live authed page; tests use synthetic
-  fixtures only. **The default order is stable + non-overlapping**, so the catalog is pages concatenated
-  until an empty one — but **Cloudflare rate-limits repeated rapid full scrapes**, returning transient
-  empty pages that would silently truncate the catalog. Mitigations: `_fetch_page_cards` retries an empty
-  page (`empty_page_retries`, backoff) before treating it as the end; the catalog is cached
-  `metadata_cache_ttl_seconds = 900` and the provider is reused across polls (so ~one scrape per 15 min).
-  A single cold scrape gets the whole catalog (~2000 songs, ~25s); heavy repeated access can still
-  truncate. **The real fix for a large/growing catalog is lazy per-page pagination** (fetch only the
-  viewed page — far fewer requests, no throttle) — the eager full-scrape is a known limitation.
+  fixtures only.
+- **Browsing is LAZY — never scrape the whole catalog (it's ~2000+ songs and Cloudflare rate-limits
+  rapid full scrapes).** `query_page` fetches only the FeedForge page(s) covering the requested window
+  (`_PAGE_SIZE = 25`/page, 1-indexed, stable + non-overlapping order — verified), mapping core's
+  `(page, size)` onto that grid and slicing. **Server-side query params ride along**: `?q=` is a real
+  full-text **search** (verified — returns matching songs), `?sort=` maps via `_SORT_MAP` (only
+  verified-stable sorts; unknown → default order). There is **no total on the page**, so `query_page`
+  reports an *at-least* total that grows while full pages keep coming and settles exactly at the last
+  (short) page — never triggering the binary search, so browsing stays lazy. The **source-card count**
+  (`describe_source` / `query_stats.total_songs`) comes from `_catalog_total()` — a binary search for the
+  last non-empty page (exponential probe + bisect, `attempts=1` since past-the-end empties are expected;
+  ~6 s, cached `metadata_cache_ttl_seconds = 900`, provider reused across polls → runs ~once/15 min on
+  add/status, not per browse). `_fetch_ff_page` caches only *non-empty* pages (an empty probe must not
+  poison a later browse) and populates `_card_cache` so sync/art resolve a browsed song by id without
+  re-fetching. **Tradeoff (deliberate): the A–Z letter rail and browse-by-artist degrade** —
+  `query_stats.letters` is `{}` and `query_artists` returns `([], 0)`, because both need the whole
+  catalog which we no longer hold. The song list + search is the supported browse path.
 - **FeedForge hosts nothing — download is resolve-then-fetch, reusing the Drive path + a Dropbox
   fixup.** `sync_song` is non-blocking (same ~250 ms core cap and background machinery as Google/Proton;
   the screen's click handler + `/downloads` poller treat `feedforge:` ids like `gdrive:`). `_do_sync`

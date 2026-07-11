@@ -31,7 +31,6 @@ import json
 import re
 import threading
 import time
-from collections import OrderedDict
 from pathlib import Path
 from urllib import error, parse, request
 
@@ -71,6 +70,21 @@ _SESSION_COOKIE = "__Secure-next-auth.session-token"
 # The catalog is a few thousand songs (~60-100 pages of 25) and grows over time; this is a
 # backstop against a runaway loop, set well above the real size — not an expected limit.
 _MAX_LIBRARY_PAGES = 400
+# FeedForge serves a fixed 25 songs per /library page (verified live). A module constant so
+# tests can monkeypatch a smaller page size to exercise multi-page mapping cheaply.
+_PAGE_SIZE = 25
+# Map FeedBack's sort vocabulary to FeedForge's server-side ?sort= values (verified: the default
+# order and ?sort=artist both paginate stably + non-overlapping). An unmapped sort falls through
+# to FeedForge's default stable order rather than risking an unstable one that breaks paging.
+_SORT_MAP = {
+    "artist": "artist",
+    "title": "title",
+    "newest": "newest",
+    "updated": "updated",
+    "downloads": "downloads",
+    "date": "newest",
+    "recent": "newest",
+}
 
 # ---- scrape selectors (verified live against feedforge.org 2026-07-10; adjust if the markup
 # drifts). The catalog is a <table>: each song is a <tr> with a `song-title` anchor to
@@ -151,6 +165,16 @@ def _direct_download_url(url: str) -> str:
     return url
 
 
+def _filename_from_url(url: str, song_id: str) -> str:
+    """Best-effort package filename from a resolved download URL (it usually ends in
+    ``…/Artist-Title.feedpak?…``), falling back to the song id. Used when a song was synced
+    without being browsed (no cached card) so it still imports under a meaningful, stable name."""
+    name = parse.unquote(Path(parse.urlparse(str(url or "")).path).name)
+    if name and name.lower().endswith(PACKAGE_SUFFIXES):
+        return sanitize_filename(name, "remote-song.feedpak")
+    return sanitize_filename(song_id, "remote-song") + ".feedpak"
+
+
 def parse_library_html(text: str) -> list[dict]:
     """Parse the server-rendered ``/library`` table into a list of card dicts.
 
@@ -228,6 +252,9 @@ class FeedForgeProvider(BaseLibraryProvider):
         self.label = str(source.get("label") or source.get("sourceName") or default_label)
         # Serialize logins so N concurrent requests hitting an expired session re-auth once.
         self._login_lock = threading.Lock()
+        # Cards seen while browsing, keyed by song id. Lazy browsing never holds the whole
+        # catalog, so sync/art look a song up here (populated by query_page) instead of scanning.
+        self._card_cache: dict[str, dict] = {}
         # Background-sync state (FeedBack core caps sync-song at ~250ms — far too short for an
         # internet download — so downloads run off-thread; see sync_song). song_id -> entry.
         self._sync_lock = threading.Lock()
@@ -333,57 +360,92 @@ class FeedForgeProvider(BaseLibraryProvider):
                 raise AuthRequiredError("FeedForge session could not be established")
         return text
 
-    # -- catalog ---------------------------------------------------------
+    # -- catalog (lazy: only the viewed page is fetched; the full catalog is never scraped) ----
 
-    def _fetch_all_cards(self) -> list[dict]:
-        # The default /library order is stable and pages don't overlap (verified live), so the
-        # catalog is the concatenation of pages until an empty one. But a page can *transiently*
-        # come back empty (a Cloudflare/render hiccup) — which previously truncated the catalog
-        # mid-scrape — so _fetch_page_cards retries an empty page once before we treat it as the
-        # true end.
-        cards: list[dict] = []
-        seen: set[str] = set()
-        for page in range(1, _MAX_LIBRARY_PAGES + 1):
-            page_cards = self._fetch_page_cards(page)
-            if not page_cards:
-                break  # confirmed end of catalog (empty even after a retry)
-            fresh = [card for card in page_cards if card["song_id"] not in seen]
-            if not fresh:
-                break  # a full page of only already-seen songs => pagination looped; stop
-            for card in fresh:
-                seen.add(card["song_id"])
-            cards.extend(fresh)
-        return cards
+    def _query_params(self, q: str = "", sort: str = "") -> dict:
+        """Server-side query params for a /library request: full-text ``?q=`` + a mapped ``?sort=``."""
+        params: dict[str, str] = {}
+        q = str(q or "").strip()
+        if q:
+            params["q"] = q[:200]
+        sort_value = _SORT_MAP.get(str(sort or "").lower())
+        if sort_value:
+            params["sort"] = sort_value
+        return params
 
-    def _fetch_page_cards(self, page: int) -> list[dict]:
-        """One catalog page's cards, retrying an empty/errored result a few times with backoff so
-        a transient empty page (a Cloudflare rate-limit blip) doesn't prematurely end the scrape.
-        Returns ``[]`` only when the page stays empty across all attempts (the true end of the
-        catalog). A lapsed session still raises."""
-        for attempt in range(self.empty_page_retries):
+    def _fetch_page_cards(self, ff_page: int, params: dict | None = None, attempts: int | None = None) -> list[dict]:
+        """One FeedForge library page's cards for a given query. During *browsing* an empty/errored
+        result is retried a few times with backoff so a transient empty page (a Cloudflare
+        rate-limit blip) isn't mistaken for the end; the catalog-size probe passes ``attempts=1``
+        since there empties are expected (past the end) and retrying them is pure latency. Returns
+        ``[]`` only when the page stays empty. A lapsed session still raises."""
+        attempts = self.empty_page_retries if attempts is None else max(1, attempts)
+        path = "/library?" + parse.urlencode({"page": ff_page, **(params or {})})
+        for attempt in range(attempts):
             try:
-                page_cards = parse_library_html(self._authed_html(f"/library?page={page}"))
+                page_cards = parse_library_html(self._authed_html(path))
             except AuthRequiredError:
                 raise  # a lapsed/invalid session must surface, not look like an empty catalog
             except Exception:
                 page_cards = []
             if page_cards:
                 return page_cards
-            if attempt + 1 < self.empty_page_retries and self.empty_page_backoff_seconds:
+            if attempt + 1 < attempts and self.empty_page_backoff_seconds:
                 time.sleep(self.empty_page_backoff_seconds * (attempt + 1))
         return []
 
-    def _entries(self) -> list[dict]:
-        key = self._metadata_cache_key("catalog", {"base": self.base_url, "user": self.username})
-        cached = self._cache_get(key)
+    def _fetch_ff_page(self, ff_page: int, params: dict, attempts: int | None = None) -> list[dict]:
+        """Fetch one FeedForge page and remember its cards by id, so sync/art can resolve a browsed
+        song without re-fetching. A non-empty result is cached; an empty one is not (it may be a
+        transient blip or an end-of-catalog probe — caching it could poison a later browse)."""
+        cache_key = self._metadata_cache_key(f"page:{ff_page}", params)
+        cached = self._cache_get(cache_key)
         if cached is not None:
-            return list(cached.get("cards") or [])
-        cards = self._fetch_all_cards()
-        self._cache_put(key, {"cards": cards})
+            cards = list(cached.get("cards") or [])
+        else:
+            cards = self._fetch_page_cards(ff_page, params, attempts=attempts)
+            if cards:
+                self._cache_put(cache_key, {"cards": cards})
+        for card in cards:
+            self._card_cache[card["song_id"]] = card
         return cards
 
+    def _catalog_total(self) -> int:
+        key = self._metadata_cache_key("catalog_total", {})
+        cached = self._cache_get(key)
+        if cached is not None:
+            return int(cached.get("total") or 0)
+        total = self._compute_catalog_total()
+        self._cache_put(key, {"total": total})
+        return total
+
+    def _compute_catalog_total(self) -> int:
+        """Approximate the catalog size without a full scrape. Pages are ``_PAGE_SIZE``, contiguous
+        and stable, so the size is ``(last_non_empty_page - 1) * _PAGE_SIZE + len(last_page)``. Find
+        the last non-empty page by an exponential probe + binary search — a handful of single-page
+        fetches (cached), not ~80. Under heavy rate-limiting a probed page can come back empty and
+        undercount; that only skews the *displayed* total, never what query_page can fetch."""
+        def count(ff_page: int) -> int:
+            # attempts=1: empties here are expected (probing past the end), not blips to retry.
+            return len(self._fetch_ff_page(ff_page, {}, attempts=1))
+
+        if count(1) == 0:
+            return 0
+        low, high = 1, 2
+        while high <= _MAX_LIBRARY_PAGES and count(high) > 0:
+            low, high = high, high * 2
+        high = min(high, _MAX_LIBRARY_PAGES + 1)
+        while low + 1 < high:  # largest page with content in [low, high)
+            mid = (low + high) // 2
+            if count(mid) > 0:
+                low = mid
+            else:
+                high = mid
+        return (low - 1) * _PAGE_SIZE + count(low)
+
     def _card_by_id(self, song_id: str) -> dict | None:
-        return next((card for card in self._entries() if card["song_id"] == song_id), None)
+        # From the browse cache only — lazy browsing never holds the whole catalog.
+        return self._card_cache.get(song_id)
 
     # -- normalization + querying ---------------------------------------
 
@@ -447,83 +509,59 @@ class FeedForgeProvider(BaseLibraryProvider):
             "playFilename": local,
         }
 
-    def _all_songs(self) -> list[dict]:
-        downloaded = self._downloaded_names()
-        songs = [self._normalize_card(card, downloaded) for card in self._entries()]
-        songs.sort(key=lambda song: (song["artist"].lower(), song["title"].lower()))
-        return songs
-
-    def _apply_text_query(self, songs: list[dict], q: str = "", **_kwargs) -> list[dict]:
-        needle = str(q or "").strip().lower()
-        if not needle:
-            return songs
-        return [
-            song for song in songs
-            if needle in song["title"].lower()
-            or needle in song["artist"].lower()
-            or needle in (song["album"] or "").lower()
-            or needle in (song["tuning"] or "").lower()
-        ]
-
-    def query_page(self, page: int = 0, size: int = 24, sort: str = "artist", direction: str = "asc", **kwargs):
+    def query_page(self, page: int = 0, size: int = 24, sort: str = "artist",
+                   direction: str = "asc", **kwargs):
+        # Lazy: fetch only the FeedForge page(s) covering the requested window, with server-side
+        # search (?q=) + sort. FeedForge is _PAGE_SIZE/page and stable, so map core's (page, size)
+        # onto that grid and slice.
         if kwargs.get("favorites_only"):
             return [], 0
-        songs = self._apply_text_query(self._all_songs(), **kwargs)
-        if str(direction or "asc").lower() == "desc":
-            songs = list(reversed(songs))
-        total = len(songs)
         size = max(1, min(100, _safe_int(size, 24)))
         page = max(0, _safe_int(page, 0))
+        params = self._query_params(q=kwargs.get("q", ""), sort=sort)
         offset = page * size
-        return songs[offset:offset + size], total
+        first_ff = offset // _PAGE_SIZE + 1
+        last_ff = (offset + size - 1) // _PAGE_SIZE + 1
+        window: list[dict] = []
+        ended = False
+        for ff_page in range(first_ff, last_ff + 1):
+            cards = self._fetch_ff_page(ff_page, params)
+            window.extend(cards)
+            if len(cards) < _PAGE_SIZE:
+                ended = True  # a short page is the last page of results — nothing beyond it
+                break
+        local_offset = offset - (first_ff - 1) * _PAGE_SIZE
+        page_cards = window[local_offset:local_offset + size]
+        downloaded = self._downloaded_names()
+        songs = [self._normalize_card(card, downloaded) for card in page_cards]
+        # There is no server total, and computing one requires probing (see _catalog_total, used
+        # only for the source-card count on add/status). Keep browsing truly lazy — fetch only the
+        # window — and report an *at-least* total: it grows while full pages keep coming and settles
+        # to the exact count at the last (short) page. "more" == the window ran to a full final page
+        # or has rows past this slice, so more results follow.
+        more = not ended or len(window) > local_offset + size
+        total = offset + len(page_cards) + (_PAGE_SIZE if more else 0)
+        return songs, total
 
     def query_artists(self, letter: str = "", page: int = 0, size: int = 50, **kwargs):
-        if kwargs.get("favorites_only"):
-            return [], 0
-        songs = self._apply_text_query(self._all_songs(), **kwargs)
-        by_artist: "OrderedDict[str, list[dict]]" = OrderedDict()
-        for song in songs:
-            by_artist.setdefault(song["artist"], []).append(song)
-        artist_names = sorted(by_artist, key=str.lower)
-        if letter:
-            artist_names = [name for name in artist_names if name[:1].upper() == letter.upper()]
-        total = len(artist_names)
-        size = max(1, _safe_int(size, 50))
-        page = max(0, _safe_int(page, 0))
-        artists = []
-        for name in artist_names[page * size:page * size + size]:
-            by_album: "OrderedDict[str, list[dict]]" = OrderedDict()
-            for song in by_artist[name]:
-                by_album.setdefault(song["album"], []).append(song)
-            albums = [{"name": album, "song_count": len(items), "songs": items} for album, items in by_album.items()]
-            artists.append({
-                "name": name,
-                "album_count": len(albums),
-                "song_count": len(by_artist[name]),
-                "albums": albums,
-            })
-        return artists, total
+        # Browse-by-artist needs the whole catalog (FeedForge exposes no artist list or total),
+        # which the lazy design deliberately never scrapes. Degrade to empty: the song list
+        # (query_page) + server-side search is the supported browse path for FeedForge.
+        return [], 0
 
     def query_stats(self, **kwargs) -> dict:
-        if kwargs.get("favorites_only"):
+        # Only the total is cheap (binary-searched); the A–Z letter rail + artist count need the
+        # whole catalog, so they degrade to empty. A filtered/search view has no known total.
+        if kwargs.get("favorites_only") or str(kwargs.get("q") or "").strip():
             return {"total_songs": 0, "total_artists": 0, "letters": {}}
-        songs = self._apply_text_query(self._all_songs(), **kwargs)
-        letters: dict[str, int] = {}
-        artists = {song["artist"] for song in songs}
-        for artist in artists:
-            letter = artist[:1].upper() if artist else "#"
-            if not letter.isalpha():
-                letter = "#"
-            letters[letter] = letters.get(letter, 0) + 1
-        return {"total_songs": len(songs), "total_artists": len(artists), "letters": letters}
+        return {"total_songs": self._catalog_total(), "total_artists": 0, "letters": {}}
 
     def describe_source(self) -> dict:
-        cards = self._entries()
         return {
             "ok": True,
             "sourceId": f"feedforge_{self._account_key}",
             "sourceName": self.label,
-            "songCount": len(cards),
+            "songCount": self._catalog_total(),
             "capabilities": ["library.read", "song.sync"],
             "server": {"protocol": self.type},
         }
@@ -594,9 +632,11 @@ class FeedForgeProvider(BaseLibraryProvider):
         return url
 
     def _do_sync(self, song_id: str) -> dict:
-        card = self._card_by_id(song_id)
-        remote_name = self._remote_filename(card) if card else (sanitize_filename(song_id, "remote-song") + ".feedpak")
         url = self._resolve_download_url(song_id)
+        # Name the local file deterministically: from the browsed card if we have it, else from
+        # the resolved URL (…/Artist-Title.feedpak). Keeps settingsKey stable (see _remote_filename).
+        card = self._card_by_id(song_id)
+        remote_name = self._remote_filename(card) if card else _filename_from_url(url, song_id)
         file_id = drive_file_id_from_url(url)
         if file_id:
             # The common case: FeedForge points at Google Drive — reuse the Drive download
@@ -609,7 +649,6 @@ class FeedForgeProvider(BaseLibraryProvider):
             target, content_hash, bytes_read, _headers = self._download_url_to_cache(
                 _direct_download_url(url), remote_name, self._download_headers()
             )
-        self.clear_metadata_cache()
         result = {
             "ok": True,
             "song_id": song_id,
