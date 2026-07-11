@@ -311,7 +311,16 @@ class FeedForgeProvider(BaseLibraryProvider):
         cards: list[dict] = []
         seen: set[str] = set()
         for page in range(1, _MAX_LIBRARY_PAGES + 1):
-            page_cards = parse_library_html(self._authed_html(f"/library?page={page}"))
+            try:
+                page_cards = parse_library_html(self._authed_html(f"/library?page={page}"))
+            except AuthRequiredError:
+                raise  # a lapsed/invalid session must surface, not look like an empty catalog
+            except Exception:
+                # A page past the end may 404/err (we don't know the out-of-range behavior);
+                # once we already have songs, treat that as the end rather than failing.
+                if cards:
+                    break
+                raise
             fresh = [card for card in page_cards if card["song_id"] not in seen]
             for card in fresh:
                 seen.add(card["song_id"])

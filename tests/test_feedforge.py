@@ -259,6 +259,23 @@ def test_catalog_paginates_until_empty_page(tmp_path):
     assert len(library_fetches) == 3  # page 1, page 2, empty page 3 -> stop
 
 
+def test_catalog_stops_gracefully_when_page_past_end_errors(tmp_path):
+    # We don't know FeedForge's out-of-range ?page behavior; if a page past the catalog errors
+    # (e.g. 404) rather than returning empty, keep the songs gathered so far instead of failing.
+    provider = FakeFeedForge(tmp_path)
+    calls = {"n": 0}
+
+    def flaky(_path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _library_html(FAKE_CARDS)
+        raise RuntimeError("404 page not found")
+
+    provider._authed_html = flaky
+    _songs, total = provider.query_page(size=50)
+    assert total == 3
+
+
 def test_query_stats_and_artists(tmp_path):
     provider = FakeFeedForge(tmp_path, pages={1: _library_html(FAKE_CARDS)})
 
