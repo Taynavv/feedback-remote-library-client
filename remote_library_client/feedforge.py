@@ -303,7 +303,10 @@ class FeedForgeProvider(BaseLibraryProvider):
         self._records: dict[str, dict] = {}
         self._mirror_load_mtime: float | None = None  # mtime of the persisted mirror we last read
         self._mirror_complete = False
-        self._synced_at = 0.0  # monotonic time of the last successful walk/delta
+        # Monotonic time of the last successful walk/delta. -inf = never synced: 0.0 would NOT
+        # read as stale on a low-uptime host (time.monotonic() is seconds-since-boot on Linux,
+        # so shortly after boot `monotonic() - 0.0` can sit under the TTL).
+        self._synced_at = float("-inf")
         self._watermark = ""  # updatedAfter cursor (the last walk/delta start time, ISO)
         self._delta_etag = ""  # ETag of the last unchanged-watermark delta request
         self._full_walk_wall = 0.0  # wall-clock time of the last *completed* full walk
@@ -439,7 +442,9 @@ class FeedForgeProvider(BaseLibraryProvider):
         self._delta_etag = str(raw.get("etag") or "")
         self._full_walk_wall = float(raw.get("fullWalkAt") or 0.0)
         self._mirror_complete = True
-        self._synced_at = 0.0  # deliberately stale: first use delta-refreshes
+        # Deliberately stale (-inf, NOT 0.0 — see __init__) so the first use delta-refreshes,
+        # which also revalidates the key after a restart.
+        self._synced_at = float("-inf")
 
     def _persist_mirror_locked(self) -> None:
         payload = {
