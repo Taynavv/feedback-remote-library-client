@@ -4,7 +4,7 @@ Remote Library Client connects [FeedBack](https://github.com/got-feedback/feedBa
 
 - **Remote Library Server** — a [Remote Library Server](https://github.com/Taynavv/feedback-remote-library-server) URL speaking the full metadata/search/artwork/NAM-tone protocol.
 - **Remote Server over iroh** — the *same* Remote Library Server, reached **peer-to-peer by a Library ID** with no port forwarding. Paste the ID the server shows and its songs appear in FeedBack. See [Source types](#source-types).
-- **FeedForge account** — a [FeedForge](https://feedforge.org) community-catalog account. Enter your username and password and its catalog appears in FeedBack, with server-side search. See [Source types](#source-types).
+- **FeedForge** — a [FeedForge](https://feedforge.org) community-catalog account, connected through FeedForge's official plugin API with a personal **access key** (the plugin never sees your password or Discord login). The whole catalog appears in FeedBack with instant local search and sorting. See [Source types](#source-types).
 - **Public Google Drive folder** — a public ("anyone with the link") Google Drive folder of package files; paste the folder link and its songs show up in FeedBack. See [Source types](#source-types).
 - **Public Proton Drive share** — an anonymous, end-to-end-encrypted Proton Drive share of package files; paste the share link (with its password) and its songs show up in FeedBack. See [Source types](#source-types).
 
@@ -46,7 +46,7 @@ The plugin declares the core `library` capability as a provider. Its manifest us
 
 ## Source types
 
-Every source implements the same FeedBack library-provider interface; the types differ only in how they reach the remote library and how much metadata it exposes. You choose the type when adding a source (**+ → Source type**), and the form adapts — the Access token field only appears for a Remote Library Server, and the FeedForge type shows username + password fields instead.
+Every source implements the same FeedBack library-provider interface; the types differ only in how they reach the remote library and how much metadata it exposes. You choose the type when adding a source (**+ → Source type**), and the form adapts — the token/key field appears only for the types that use one (a Remote Library Server's optional access token, the same token over iroh, and the required **FeedForge access key**); Google Drive and Proton Drive need only their link.
 
 ### Remote Library Server (`slopsmith-direct-library.v1`)
 
@@ -94,26 +94,29 @@ Paste the **whole** share link, including the `#…` password fragment — that 
 Notes and limits:
 
 - The share must be a **public** ("anyone with the link") share, and the link must include its **generated password** (the `#…` fragment). Shares with a separate custom password are not supported yet.
-- Proton has a **native dependency**: its encryption requires `bcrypt` and `pysequoia`, listed in [requirements.txt](requirements.txt) and installed by FeedBack on load. The **direct-server and Google Drive** types have no dependencies, so they keep working even where a native wheel can't be installed. (The iroh type also has a native dependency — the `iroh` wheel.)
+- Proton has a **native dependency**: its encryption requires `bcrypt` and `pysequoia`, listed in [requirements.txt](requirements.txt) and installed by FeedBack on load. The **direct-server, Google Drive, and FeedForge** types have no dependencies, so they keep working even where a native wheel can't be installed — with one FeedForge edge: a song whose uploader hosts the file on Proton Drive needs the Proton dependencies at download time. (The iroh type also has a native dependency — the `iroh` wheel.)
 - Proton's public-share API is undocumented and changes over time; if listing suddenly fails, the plugin may need an update.
 
-### FeedForge account (`feedforge.v1`)
+### FeedForge (`feedforge.v1`)
 
-A [FeedForge](https://feedforge.org) ("FeedForge Hub") community-catalog **account**. Choose **FeedForge** in the type picker and enter your **username and password** (the URL is optional and defaults to `feedforge.org`), and the client:
+A [FeedForge](https://feedforge.org) ("FeedForge Hub") community-catalog account, connected through FeedForge's **official plugin API** with a personal **access key** — the plugin never sees your FeedForge password or Discord login.
 
-- **logs in** to your FeedForge account with its standard username/password sign-in, and keeps the session alive across use;
-- **browses the catalog** — the song list with real title / artist / album / tuning / year / duration and cover art, plus **server-side full-text search**. Browsing is lazy (only the page you're viewing is fetched), so even a multi-thousand-song catalog loads quickly;
-- **downloads** a song into your local library the first time you play it. FeedForge hosts nothing itself — each song resolves to an external link (a Google Drive or Dropbox file), which the client fetches in the background (exactly like the Google Drive / Proton types).
+**Creating the key:** sign in at feedforge.org, open **Profile → Connected apps**, name a new key (e.g. "FeedBack"), press **Create key**, and copy the `ffp_…` value. FeedForge shows the full key only once, each account keeps one active key (paste the *same* key on a second machine), and you can revoke it from that page at any time. Then choose **FeedForge** in the type picker and paste the key (the URL is optional and defaults to `feedforge.org`). The client:
 
-Your **password** is stored locally with the source and stripped from every response (like an access token); only the username is shown. No FeedForge API key is required — there isn't one.
+- **syncs the catalog to a local mirror** on first add — a paced walk of the API (a few thousand songs take a couple of minutes; the source card shows *"Syncing the FeedForge catalog…"* and songs appear as they arrive), then stays fresh with cheap incremental updates;
+- **browses locally** — search, **every sort option** (including Z–A and Year), the **A–Z letter rail**, and **browse-by-artist** all run instantly against the mirror, with real title / artist / album / tuning / year / duration and cover art;
+- **downloads** a song into your local library the first time you play it. FeedForge hosts nothing itself — each song resolves through the API's tracked download endpoint (so your FeedForge download history and the public counters stay accurate) to an external link — **Google Drive, Dropbox, or a Proton Drive share** — which the client fetches in the background (exactly like the Google Drive / Proton types).
+
+Your **access key is a secret**: stored locally with the source, sent **only** to feedforge.org, and stripped from every response (like a server access token). Change or clear it any time with the **key** button on the source card. Keys expire after ~180 days — when yours does, the card shows **Key required** and you paste a fresh one.
 
 **Playing a song** works exactly like the Google Drive type: the first click on a not-yet-downloaded song shows a **"Downloading…"** notification, then **"Ready to play"** when it lands; click again to play. Already-downloaded songs play on the first click.
 
 Notes and limits:
 
-- **Username/password accounts only.** Discord-login accounts are not supported by this build — a Discord session can't be automated without a real browser, and the clean fix needs a capability FeedBack core doesn't expose to plugins yet.
-- The catalog is read by **scraping the website** (FeedForge has no public API), so a site redesign can break listing until the plugin is updated — the same class of fragility as the Google Drive folder type.
-- **Sort is partial.** Artist A–Z, Title A–Z, and Recently-Added work; FeedForge itself has no descending or year sort, so "Artist Z–A", "Title Z–A", and "Year (newest)" fall back to the closest ascending field. The **A–Z letter rail and browse-by-artist are disabled** (they'd require reading the whole catalog, which the lazy design avoids) — the song list plus search is the browse path.
+- **Discord-login accounts work** — the key is created in your browser, so how you sign in to FeedForge doesn't matter.
+- The client stays inside FeedForge's documented API **rate limits**: the initial sync paces itself, and day-to-day browsing is local (near-zero API traffic).
+- A song whose uploader hosts the file on **Proton Drive** needs the Proton native dependencies (`bcrypt` + `pysequoia`, from [requirements.txt](requirements.txt)) at download time; everything else about the source works without them.
+- Favorites, collections, ratings, and uploads aren't part of FeedForge's plugin API — use the website for those.
 - No extra dependency — like the Google Drive type, it runs on the standard stdlib HTTP stack.
 
 ## Flow
@@ -141,7 +144,7 @@ flowchart LR
 
 1. Install this client plugin in FeedBack (see [Install](#install)).
 2. Open **Remote Client**, click **+**, and choose a **Source type**:
-   - **FeedForge** — enter your feedforge.org **username and password** (the URL defaults to feedforge.org; no API key needed).
+   - **FeedForge** — paste a FeedForge **access key** (create one at feedforge.org under **Profile → Connected apps**; the URL defaults to feedforge.org).
    - **Google Drive** — paste a public ("anyone with the link") folder link. No server, login, or token required.
    - **Proton Drive** — paste a public share link *including its `#…` password*. No Proton account or login required.
    - **Remote Server over iroh** — paste the **Library ID** the server shows under its “Share over iroh” panel (plus an access token if it set one). No URL, no port forwarding.
@@ -159,7 +162,7 @@ NAM tone sync is best-effort and non-fatal: if the server doesn't share tone ass
 
 ## Authentication & security
 
-- **Access tokens.** If a Remote Library Server requires a bearer token, the client prompts for it when you add the source (and shows a **Token required** badge otherwise). Set, change, or clear a token later with the **key** button on the source card. The token is stored locally with the source and sent as `Authorization: Bearer <token>` (or a `?token=` query parameter for non-ASCII tokens, which HTTP headers cannot carry); it is never echoed back to the browser. This applies identically to the **iroh** type — the token rides the tunnelled request unchanged, so it protects a server shared over iroh exactly as one reached by URL. (The Library ID authenticates *which* server you reach; the token controls *access* to it.)
+- **Access tokens.** If a Remote Library Server requires a bearer token, the client prompts for it when you add the source (and shows a **Token required** badge otherwise). Set, change, or clear a token later with the **key** button on the source card. The token is stored locally with the source and sent as `Authorization: Bearer <token>` (or a `?token=` query parameter for non-ASCII tokens, which HTTP headers cannot carry); it is never echoed back to the browser. This applies identically to the **iroh** type — the token rides the tunnelled request unchanged, so it protects a server shared over iroh exactly as one reached by URL. (The Library ID authenticates *which* server you reach; the token controls *access* to it.) The **FeedForge access key** uses the same storage, stripping, and card controls, and is only ever sent to the configured feedforge.org origin.
 - **Redirect protection.** By default the client refuses to follow a server redirect that pivots to a different internal / loopback host (an SSRF guard). If a trusted server legitimately relies on such a redirect, enable **Allow unsafe redirects** on that source. Only add servers you trust — see [SECURITY.md](SECURITY.md).
 
 ## Development

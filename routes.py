@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 from __future__ import annotations
 
+import secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib import parse
@@ -8,6 +9,9 @@ from urllib import parse
 from fastapi import HTTPException
 
 from remote_library_client.feedforge import (
+    CATALOG_SYNCING_MESSAGE,
+    KEY_MIGRATE_MESSAGE,
+    KEY_REQUIRED_MESSAGE,
     FeedForgeProvider,
     is_feedforge_url,
     normalize_feedforge_base_url,
@@ -150,15 +154,28 @@ def _import_library_file(package_path: Path, local_root: Path) -> dict | None:
     return {"libraryImportState": "indexed", "libraryFilename": filename}
 
 
-def _register_source_provider(source: dict, *, replace: bool = True) -> DirectLibraryProvider | None:
+def _register_provider_instance(
+    provider: BaseLibraryProvider, source: dict, *, replace: bool = True
+) -> BaseLibraryProvider | None:
+    """Register an already-built provider, keeping its warm state (catalog mirror, sessions).
+
+    Constructing a *second* instance from the same source and registering that instead leaves
+    the registered one cold — for FeedForge that meant an unregistered throwaway thread walked
+    the whole catalog while the provider actually serving core browsed an empty mirror."""
     if not _source_enabled(source):
         _unregister_source_provider(source.get("providerId") or "")
         return None
-    provider = _provider_for_source(source)
     if callable(_register_provider):
         _register_provider(provider, replace=replace)
     _providers[provider.id] = provider
     return provider
+
+
+def _register_source_provider(source: dict, *, replace: bool = True) -> BaseLibraryProvider | None:
+    if not _source_enabled(source):
+        _unregister_source_provider(source.get("providerId") or "")
+        return None
+    return _register_provider_instance(_provider_for_source(source), source, replace=replace)
 
 
 def _unregister_source_provider(provider_id: str) -> None:
@@ -391,35 +408,48 @@ def _save_checked_iroh_source(source: dict) -> dict:
     }
 
 
-def _feedforge_source(seed: dict, provider: BaseLibraryProvider | None = None) -> dict:
-    """Build (or refresh) a FeedForge source: normalize the base URL, then log in + scrape the
-    catalog to validate the credentials and count songs. The ``password`` is a secret — stored
-    per source and stripped from every API response by ``_public_source`` (the ``username`` is
-    not secret and is kept).
+def _feedforge_source(seed: dict, provider: BaseLibraryProvider | None = None) -> tuple[dict, BaseLibraryProvider]:
+    """Build (or refresh) a FeedForge source from a user-created **access key** (the ``token``
+    field — a secret, stripped from every API response by ``_public_source``), validating it
+    against the v1 API and counting songs from the catalog mirror. A legacy credentials-era
+    source (username/password, no key) raises ``AuthRequiredError`` so its card prompts for a
+    key; the stored password is dropped the moment a key takes over.
 
-    Pass an already-registered ``provider`` to reuse its logged-in session — re-authenticating
-    on every status poll would be wasteful and risk Cloudflare/anti-abuse throttling (the same
-    reason the Proton path reuses its provider)."""
+    Returns ``(source, provider)`` — **the provider that performed the describe**, so callers
+    register that exact instance. Pass an already-registered ``provider`` to reuse its catalog
+    mirror; building a fresh instance per call would kick a from-scratch catalog walk each
+    time (and once left the registered provider cold while a throwaway thread walked)."""
     base_url = normalize_feedforge_base_url(seed.get("baseUrl") or "")
-    username = str(seed.get("username") or "").strip()
-    password = str(seed.get("password") or "")
-    if not username or not password:
-        raise ValueError("FeedForge needs a username and password")
+    token = str(seed.get("token") or "").strip()
+    if not token:
+        legacy = bool(seed.get("password") or seed.get("username"))
+        raise AuthRequiredError(KEY_MIGRATE_MESSAGE if legacy else KEY_REQUIRED_MESSAGE)
     host = parse.urlparse(base_url).hostname or "feedforge.org"
+    # The v1 API exposes no account identity (no whoami endpoint — raised with the FeedForge
+    # dev), so mint a per-source random seed once: it keeps providerId (and the local import
+    # folder) stable across key rotations, and two different accounts distinct. Legacy sources
+    # keep their username-derived providerId.
+    account_seed = str(seed.get("accountSeed") or "").strip()
+    if not account_seed and not seed.get("providerId"):
+        account_seed = secrets.token_hex(4)
+    ident = account_seed or str(seed.get("username") or "").strip()
     source = {
         **seed,
         "type": FeedForgeProvider.type,
         "baseUrl": base_url,
-        "username": username,
-        "password": password,
+        "token": token,
+        "accountSeed": account_seed,
         "providerId": seed.get("providerId")
-        or provider_id_for_source(f"feedforge_{host}_{username}", base_url, prefix="feedforge"),
+        or provider_id_for_source(
+            f"feedforge_{host}_{ident}" if ident else f"feedforge_{host}", base_url, prefix="feedforge"
+        ),
         "enabled": _source_enabled(seed),
         "syncNamToneAssets": False,
         "allowUnsafeRedirects": bool(seed.get("allowUnsafeRedirects")),
-        "token": "",
     }
-    info = (provider or _provider_for_source(source)).describe_source()
+    source.pop("password", None)  # the credentials era is over; never keep an unused secret
+    provider = provider or _provider_for_source(source)
+    info = provider.describe_source()
     label = str(seed.get("label") or "").strip()
     source.update({
         "sourceId": info["sourceId"],
@@ -432,21 +462,25 @@ def _feedforge_source(seed: dict, provider: BaseLibraryProvider | None = None) -
         "authRequired": False,
         "lastSuccessfulContactAt": _utc_now_iso(),
     })
-    return source
+    return source, provider
 
 
 def _save_checked_feedforge_source(source: dict) -> dict:
-    # Reuse the registered provider (and its live NextAuth session) when present; only build +
-    # register a fresh one when the source is not yet registered (first add or after restart).
+    # Reuse the registered provider (and its catalog mirror) when present; on first
+    # registration, register the SAME instance that just described — never a second cold one.
     existing = _providers.get(source.get("providerId") or "")
-    updated = _feedforge_source(source, provider=existing)
-    provider = existing or _register_source_provider(updated, replace=True)
+    updated, provider = _feedforge_source(source, provider=existing)
+    if not existing:
+        provider = _register_provider_instance(provider, updated)
     _store.upsert_source(updated)
+    # While the initial walk is still filling the mirror, say so on the card — the count is an
+    # at-least value that grows on each refresh until the walk completes.
+    syncing = bool(provider and getattr(provider, "catalog_syncing", False))
     return {
         **updated,
         "registered": bool(provider and provider.id in _providers),
         "online": True,
-        "message": "",
+        "message": CATALOG_SYNCING_MESSAGE if syncing else "",
     }
 
 
@@ -555,9 +589,11 @@ def setup(app, context):
             if _source_type(source) == FeedForgeProvider.type:
                 try:
                     item.update(_save_checked_feedforge_source(source))
-                except AuthRequiredError:
+                except AuthRequiredError as exc:
+                    # Carries the actionable text: paste/replace a key, or (for a legacy
+                    # credentials-era source) migrate to one.
                     item["authRequired"] = True
-                    item["message"] = "Username or password rejected"
+                    item["message"] = _public_error_message(exc)
                 except Exception as exc:
                     item["message"] = _public_error_message(exc)
                 sources.append(_public_source(item))
@@ -632,13 +668,14 @@ def setup(app, context):
         use_feedforge = source_type == FeedForgeProvider.type or (not source_type and is_feedforge_url(raw_url))
         if use_feedforge:
             try:
-                source = _feedforge_source({
+                source, described_provider = _feedforge_source({
                     "baseUrl": raw_url,  # empty -> defaults to https://feedforge.org
-                    "username": str(data.get("username") or "").strip(),
-                    "password": str(data.get("password") or ""),
+                    "token": str(data.get("token") or "").strip(),
                     "label": str(data.get("label") or "").strip(),
                 })
-                provider = _register_source_provider(source, replace=True)
+                # Register the instance that just described (its catalog walk is already
+                # running/complete) — a second cold instance would re-walk from scratch.
+                provider = _register_provider_instance(described_provider, source, replace=True)
                 _store.upsert_source(source)
                 return {"ok": True, "source": _public_source(source), "provider": _provider_payload(provider)}
             except AuthRequiredError as exc:
