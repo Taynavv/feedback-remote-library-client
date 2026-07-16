@@ -339,6 +339,35 @@ class _ProtonShareClient:
             raise _proton_http_error(exc) from exc
 
 
+def _decrypt_child_record(child: dict, parent_decryptor) -> dict | None:
+    """Decrypt one folder child to a catalog record, or ``None`` if it is not a package file."""
+    try:
+        child_passphrase = _decrypt_with_key(child["NodePassphrase"], parent_decryptor)
+        child_decryptor = _key_decryptor(child["NodeKey"], child_passphrase)
+        # A child's Name is encrypted to its own node key; older shares encrypt it to the
+        # parent, so fall back to the parent decryptor.
+        try:
+            name_bytes = _decrypt_with_key(child["Name"], child_decryptor)
+        except Exception:
+            name_bytes = _decrypt_with_key(child["Name"], parent_decryptor)
+        name = _as_text(name_bytes).strip()
+    except Exception:
+        return None
+    if not name.lower().endswith(PACKAGE_SUFFIXES):
+        return None
+    # The per-file content key rides on the file link (FileProperties.ContentKeyPacket), not
+    # on the revision fetched at download time — capture it now while decrypting the listing.
+    file_props = child.get("FileProperties") or {}
+    return {
+        "linkId": str(child.get("LinkID") or ""),
+        "name": name,
+        "size": _safe_int(child.get("Size"), 0),
+        "nodeKey": child["NodeKey"],
+        "nodePassphrase": _as_text(child_passphrase),
+        "contentKeyPacket": file_props.get("ContentKeyPacket") or child.get("ContentKeyPacket") or "",
+    }
+
+
 # -- Provider ------------------------------------------------------------------
 
 
@@ -403,32 +432,7 @@ class ProtonPublicShareProvider(BaseLibraryProvider):
         return records
 
     def _decrypt_child(self, child: dict, root_decryptor) -> dict | None:
-        """Decrypt one folder child to a catalog record, or ``None`` if it is not a package file."""
-        try:
-            child_passphrase = _decrypt_with_key(child["NodePassphrase"], root_decryptor)
-            child_decryptor = _key_decryptor(child["NodeKey"], child_passphrase)
-            # A child's Name is encrypted to its own node key; older shares encrypt it to the
-            # parent, so fall back to the root decryptor.
-            try:
-                name_bytes = _decrypt_with_key(child["Name"], child_decryptor)
-            except Exception:
-                name_bytes = _decrypt_with_key(child["Name"], root_decryptor)
-            name = _as_text(name_bytes).strip()
-        except Exception:
-            return None
-        if not name.lower().endswith(PACKAGE_SUFFIXES):
-            return None
-        # The per-file content key rides on the file link (FileProperties.ContentKeyPacket), not
-        # on the revision fetched at download time — capture it now while decrypting the listing.
-        file_props = child.get("FileProperties") or {}
-        return {
-            "linkId": str(child.get("LinkID") or ""),
-            "name": name,
-            "size": _safe_int(child.get("Size"), 0),
-            "nodeKey": child["NodeKey"],
-            "nodePassphrase": _as_text(child_passphrase),
-            "contentKeyPacket": file_props.get("ContentKeyPacket") or child.get("ContentKeyPacket") or "",
-        }
+        return _decrypt_child_record(child, root_decryptor)
 
     def _catalog_snapshot(self) -> dict:
         with self._catalog_lock:
@@ -732,38 +736,109 @@ class ProtonPublicShareProvider(BaseLibraryProvider):
     def _decrypt_blocks_to_cache(
         self, content_key_packet: bytes, blocks: list[dict], file_decryptor, fallback_filename: str
     ) -> tuple[Path, str, int]:
-        """Download each encrypted block, decrypt it (``ContentKeyPacket`` + block = one OpenPGP
-        message under the file node key), and stream the plaintext into the cache atomically."""
-        pysequoia = _pysequoia()
-        target = self.cache_dir / sanitize_filename(fallback_filename, "remote-song.feedpak")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-        digest = hashlib.sha256()
-        total = 0
+        return _decrypt_blocks_to_file(self._client, self.cache_dir, content_key_packet, blocks,
+                                       file_decryptor, fallback_filename)
+
+
+def _decrypt_blocks_to_file(
+    client: _ProtonShareClient, cache_dir: Path, content_key_packet: bytes, blocks: list[dict],
+    file_decryptor, fallback_filename: str,
+) -> tuple[Path, str, int]:
+    """Download each encrypted block, decrypt it (``ContentKeyPacket`` + block = one OpenPGP
+    message under the file node key), and stream the plaintext into the cache atomically."""
+    pysequoia = _pysequoia()
+    target = cache_dir / sanitize_filename(fallback_filename, "remote-song.feedpak")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with tmp_path.open("wb") as handle:
+            for block in blocks:
+                # `URL` is the full block-download URL; `BareURL` is the host+prefix only (a
+                # bare fetch of it 400s), so prefer `URL` and keep BareURL as a fallback.
+                block_url = block.get("URL") or block.get("BareURL")
+                if not block_url:
+                    raise RuntimeError("Proton content block is missing its download URL")
+                encrypted = client.download_block(block_url)
+                plaintext = pysequoia.decrypt(content_key_packet + encrypted, decryptor=file_decryptor).bytes
+                if plaintext is None:
+                    raise RuntimeError("Proton content block decryption produced no data")
+                total += len(plaintext)
+                if total > MAX_PACKAGE_RESPONSE_BYTES:
+                    raise RuntimeError("Proton package exceeded size limit")
+                digest.update(plaintext)
+                handle.write(plaintext)
+        tmp_path.replace(target)
+        return target, digest.hexdigest(), total
+    finally:
         try:
-            with tmp_path.open("wb") as handle:
-                for block in blocks:
-                    # `URL` is the full block-download URL; `BareURL` is the host+prefix only (a
-                    # bare fetch of it 400s), so prefer `URL` and keep BareURL as a fallback.
-                    block_url = block.get("URL") or block.get("BareURL")
-                    if not block_url:
-                        raise RuntimeError("Proton content block is missing its download URL")
-                    encrypted = self._client.download_block(block_url)
-                    plaintext = pysequoia.decrypt(content_key_packet + encrypted, decryptor=file_decryptor).bytes
-                    if plaintext is None:
-                        raise RuntimeError("Proton content block decryption produced no data")
-                    total += len(plaintext)
-                    if total > MAX_PACKAGE_RESPONSE_BYTES:
-                        raise RuntimeError("Proton package exceeded size limit")
-                    digest.update(plaintext)
-                    handle.write(plaintext)
-            tmp_path.replace(target)
-            return target, digest.hexdigest(), total
-        finally:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def download_share_package(
+    provider: BaseLibraryProvider, share_url: str, fallback_filename: str
+) -> tuple[Path, str, int]:
+    """Download the package behind a Proton public-share link into ``provider``'s cache.
+
+    Built for other provider types that resolve a song to a Proton link (e.g. a FeedForge song
+    whose uploader hosts the file on Proton Drive) — the Drive-flavored sibling is
+    ``google_drive.download_drive_file``. Handles both link shapes seen in the wild:
+
+    - a **single-file share** (``LinkType == 2``): the root link *is* the file and the bootstrap
+      material carries its ``ContentKeyPacket`` directly (verified live);
+    - a **folder share**: the first package-suffixed child is downloaded (the whole-folder case
+      is what :class:`ProtonPublicShareProvider` is for).
+
+    The file lands under ``fallback_filename`` (the caller's deterministic name — for FeedForge
+    that keeps the ``settingsKey`` contract), never the share's own decrypted name. Requires the
+    Proton extras (``bcrypt`` + ``pysequoia``); both are imported lazily, so callers should turn
+    an ``ImportError`` into a clear "install requirements" message.
+    """
+    parsed = parse_proton_share_url(share_url)
+    if not parsed:
+        raise RuntimeError("not a recognizable Proton public-share URL")
+    token, url_password = parsed
+    if not url_password:
+        raise RuntimeError("the Proton share link is missing its password (the part after '#')")
+    client = _ProtonShareClient(token, url_password, provider._urlopen)
+    material = client.bootstrap()
+    url_passphrase = proton_srp.compute_key_password(
+        url_password, base64.b64decode(material["SharePasswordSalt"])
+    )
+    share_passphrase = _decrypt_password(material["SharePassphrase"], url_passphrase)
+    share_decryptor = _key_decryptor(material["ShareKey"], share_passphrase)
+    root_passphrase = _decrypt_with_key(material["NodePassphrase"], share_decryptor)
+    # LinkType 2 == file (a single-file share; verified live 2026-07-16). A folder share
+    # (the provider's usual diet) lists children instead.
+    if material.get("LinkType") == 2 or material.get("ContentKeyPacket"):
+        link_id = str(material.get("LinkID") or "")
+        file_decryptor = _key_decryptor(material["NodeKey"], root_passphrase)
+        revision = client.fetch_file_revision(link_id)
+        content_key = material.get("ContentKeyPacket") or revision.get("ContentKeyPacket") or ""
+    else:
+        root_decryptor = _key_decryptor(material["NodeKey"], root_passphrase)
+        record = None
+        for child in client.fetch_children(str(material.get("LinkID") or "")):
+            candidate = _decrypt_child_record(child, root_decryptor)
+            if candidate:
+                record = candidate
+                break
+        if not record:
+            raise RuntimeError("the Proton share contains no package file")
+        file_decryptor = _key_decryptor(record["nodeKey"], record["nodePassphrase"])
+        revision = client.fetch_file_revision(record["linkId"])
+        content_key = record.get("contentKeyPacket") or revision.get("ContentKeyPacket") or ""
+    if not content_key:
+        raise RuntimeError("Proton file is missing its content key")
+    blocks = sorted((revision.get("Blocks") or []), key=lambda block: _safe_int(block.get("Index"), 0))
+    if not blocks:
+        raise RuntimeError("Proton file revision has no content blocks")
+    return _decrypt_blocks_to_file(
+        client, provider.cache_dir, _armored_bytes(content_key), blocks, file_decryptor, fallback_filename
+    )
 
 
 def _share_credentials(source: dict) -> tuple[str, str]:

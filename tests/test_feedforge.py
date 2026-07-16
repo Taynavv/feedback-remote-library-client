@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import importlib
+import io
 import json
 import sys
-from http.cookiejar import Cookie
 from pathlib import Path
-from urllib import parse
+from urllib import error, parse
 
 import pytest
 from fastapi import FastAPI
@@ -13,11 +13,14 @@ from fastapi.testclient import TestClient
 
 import remote_library_client.feedforge as feedforge
 from remote_library_client.feedforge import (
+    KEY_MIGRATE_MESSAGE,
+    KEY_REJECTED_MESSAGE,
     FeedForgeProvider,
+    SongGoneError,
     _direct_download_url,
+    _reduce_record,
     is_feedforge_url,
     normalize_feedforge_base_url,
-    parse_library_html,
 )
 from remote_library_client.google_drive import drive_file_id_from_url, is_google_drive_file_url
 from remote_library_client.provider import AuthRequiredError
@@ -26,71 +29,42 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+FAKE_KEY = "ffp_fake_test_key_000000000000"
 
-# Shrink FeedForge's page size (25 in production) to 3 for every test, so multi-page lazy
-# mapping is exercised with tiny synthetic catalogs.
+
+# Shrink the API page limit (50 in production) to 3 for every test, so cursor pagination is
+# exercised with tiny synthetic catalogs; never sleep in tests.
 @pytest.fixture(autouse=True)
 def _small_pages(monkeypatch):
-    monkeypatch.setattr(feedforge, "_PAGE_SIZE", 3)
+    monkeypatch.setattr(feedforge, "_API_PAGE_LIMIT", 3)
+    monkeypatch.setattr(FeedForgeProvider, "walk_pace_seconds", 0)
 
 
-# Synthetic, content-free fixtures mirroring the real feedforge.org /library *table* (verified
-# live 2026-07-10): each song is a <tr> with facet links (?artist= / ?album= / ?tuning= / ?year=,
-# the param appearing after ?page=N) and a plain <td> duration. Obviously-fake ids/names — never
-# a real song or account.
-FAKE_CARDS = [
-    # (song_id, title, artist, album, tuning, year, duration)
-    ("cfake000000000000000000b", "Song Bravo", "Zeta Testers", "Fake Album Two", "Drop D", "2021", "3:45"),
-    ("cfake000000000000000000a", "Song Alpha", "Alpha Testers", "Fake Album One", "E Standard", "2019", "2:58"),
-    ("cfake000000000000000000c", "Song &amp; Charlie", "Alpha Testers", "", "", "", ""),
-]
+def _api_song(i: int = 0, **overrides) -> dict:
+    """One synthetic, content-free record in the shape the live v1 API returns (verified
+    2026-07-16) — notably `fileSizeBytes` as a JSON *string* (BigInt-serialized)."""
+    record = {
+        "id": f"cfake{i:019d}",
+        "title": f"Song {i:03d}",
+        "artist": f"Artist {i % 4}",
+        "album": f"Album {i % 2}",
+        "year": 2000 + i,
+        "durationSec": 180 + i,
+        "tuning": "E Standard Tuning",
+        "version": "1.0",
+        "difficultyLabel": None,
+        "fileSizeBytes": str(1000 + i),
+        "downloadCount": i,
+        "coverUrl": f"https://feedforge.org/feedpak-covers/cfakecover{i:03d}",
+        "createdAt": f"2026-06-{(i % 27) + 1:02d}T00:00:00.000Z",
+        "updatedAt": f"2026-06-{(i % 27) + 1:02d}T12:00:00.000Z",
+    }
+    record.update(overrides)
+    return record
 
 
-def _cards(n):
-    """n obviously-fake card tuples, for exercising multi-page pagination."""
-    return [
-        (f"cfake{i:019d}", f"Song {i:03d}", f"Artist {i % 4}", f"Album {i % 2}", "E Standard", str(2000 + i), "3:00")
-        for i in range(n)
-    ]
-
-
-def _facet(param, value):
-    if not value:
-        return '<span class="muted">-</span>'
-    return f'<a class="linked-cell" href="/library?page=1&amp;{param}={parse.quote_plus(value)}">{value}</a>'
-
-
-def _row_html(song_id, title, artist, album, tuning, year, duration):
-    return (
-        "<tr>"
-        '<td><span class="download-button-wrap"><button class="download-icon-button"></button></span></td>'
-        f'<td><a class="cover-thumb" href="/songs/{song_id}"><img src="/feedpak-covers/{song_id}cover?dpl=x"/></a></td>'
-        f'<td>{_facet("artist", artist)}</td>'
-        f'<td><a class="song-title" href="/songs/{song_id}">{title}</a></td>'
-        f'<td class="album-cell">{_facet("album", album)}</td>'
-        f'<td>{_facet("tuning", tuning)}</td>'
-        f'<td>{_facet("year", year)}</td>'
-        f"<td>{duration or '-'}</td>"
-        "</tr>"
-    )
-
-
-def _library_html(cards):
-    header = (
-        "<thead><tr><th>Art</th><th>Artist</th><th>Title</th><th>Album</th>"
-        "<th>Tuning</th><th>Year</th><th>Duration</th></tr></thead>"
-    )
-    body = "".join(_row_html(*card) for card in cards)
-    return f'<html><body><table class="library-table">{header}<tbody>{body}</tbody></table></body></html>'
-
-
-def _session_cookie():
-    return Cookie(
-        version=0, name="__Secure-next-auth.session-token", value="fake-session-token",
-        port=None, port_specified=False, domain="feedforge.org", domain_specified=True,
-        domain_initial_dot=False, path="/", path_specified=True, secure=True, expires=None,
-        discard=False, comment=None, comment_url=None, rest={}, rfc2109=False,
-    )
+def _songs(n: int) -> list[dict]:
+    return [_api_song(i) for i in range(n)]
 
 
 class _Resp:
@@ -114,66 +88,112 @@ class _Resp:
         return self._url
 
 
-class FakeFeedForge(FeedForgeProvider):
-    """FeedForge provider with the network stubbed: NextAuth handshake, a paginated + searchable
-    /library table served from an in-memory `catalog`, download-resolve JSON, and file bytes."""
+def _http_error(url: str, code: int, body: bytes = b"", headers: dict | None = None) -> error.HTTPError:
+    return error.HTTPError(url, code, "error", headers or {}, io.BytesIO(body))
 
-    def __init__(self, cache_dir, *, catalog=None, session_valid=True, download_payload=None,
-                 drive_bytes=b"PK\x03\x04fake-package", logout_first=False, **kwargs):
-        super().__init__(
-            {"baseUrl": "https://feedforge.org", "username": "tester", "password": "pw", "label": "Fake FeedForge"},
-            cache_dir, **kwargs,
-        )
-        self.empty_page_backoff_seconds = 0  # no real sleeping in tests
-        self._catalog = list(catalog or [])
-        self._session_valid = session_valid
+
+class FakeFeedForgeAPI(FeedForgeProvider):
+    """FeedForge provider with the network stubbed at ``_urlopen``: a cursor-paginated
+    ``/api/v1/songs`` (sort + updatedAfter honored, ETag/304 revalidation, Bearer-key auth),
+    the tracked download POST, public cover art, and external CDN bytes. The catalog walk
+    runs inline (no threads) so tests are deterministic."""
+
+    def __init__(self, cache_dir, *, catalog=None, token=FAKE_KEY, download_payload=None,
+                 file_bytes=b"PK\x03\x04fake-package", rate_limit_times=0,
+                 fail_cursor_pages_times=0, source_extra=None, **kwargs):
+        source = {
+            "baseUrl": "https://feedforge.org",
+            "token": token,
+            "label": "Fake FeedForge",
+            "accountSeed": "cafe1234",
+            **(source_extra or {}),
+        }
+        super().__init__(source, cache_dir, **kwargs)
+        self.api_catalog = list(catalog or [])
+        self._valid_key = FAKE_KEY
         self._download_payload = download_payload if download_payload is not None else {}
-        self._drive_bytes = drive_bytes
-        self._logout_first = logout_first
-        self._authed = False
-        self._library_calls = 0
+        self._file_bytes = file_bytes
+        self._rate_limit_times = rate_limit_times
+        # Fail this many cursor-bearing walk requests (page 2+) with a 500 — exercises the
+        # walk's per-page retries and resume-from-cursor.
+        self._fail_cursor_pages_times = fail_cursor_pages_times
         self.calls: list[tuple[str, str]] = []
+        self.cover_request_headers: dict | None = None
+        # Run walks inline so tests never race a thread.
+        self._start_catalog_walk = self._walk_catalog
+
+    # -- fake server -----------------------------------------------------
+
+    def _catalog_sorted(self, sort: str) -> list[dict]:
+        if sort == "updated":
+            return sorted(self.api_catalog, key=lambda r: r["updatedAt"], reverse=True)
+        return sorted(self.api_catalog, key=lambda r: r["createdAt"], reverse=True)  # newest
+
+    def _songs_response(self, url: str, req) -> _Resp:
+        qs = parse.parse_qs(parse.urlparse(url).query)
+        limit = int((qs.get("limit") or ["50"])[0])
+        cursor = (qs.get("cursor") or [""])[0]
+        updated_after = (qs.get("updatedAfter") or [""])[0]
+        if cursor and not updated_after and self._fail_cursor_pages_times > 0:
+            self._fail_cursor_pages_times -= 1
+            raise _http_error(url, 500, b'{"ok":false,"error":"transient"}')
+        rows = self._catalog_sorted((qs.get("sort") or ["updated"])[0])
+        if updated_after:
+            rows = [r for r in rows if r["updatedAt"] > updated_after]
+        start = 0
+        if cursor:
+            ids = [r["id"] for r in rows]
+            start = ids.index(cursor) + 1 if cursor in ids else len(rows)
+        page = rows[start:start + limit]
+        etag = 'W/"' + ("-".join(r["id"][-4:] for r in page) or "empty") + f"-{len(rows)}" + '"'
+        if not cursor and req.get_header("If-none-match") == etag:
+            raise _http_error(url, 304)
+        has_more = start + limit < len(rows)
+        body = {
+            "ok": True,
+            "data": page,
+            "pagination": {
+                "limit": limit,
+                "nextCursor": page[-1]["id"] if (page and has_more) else None,
+                "hasMore": has_more,
+            },
+        }
+        return _Resp(json.dumps(body).encode(), {"Content-Type": "application/json", "ETag": etag}, url)
 
     def _urlopen(self, req, timeout):
         url = req.full_url
         method = req.get_method()
-        path = url[len(self.base_url):] if url.startswith(self.base_url) else url
-        self.calls.append((method, path))
-        if path.startswith("/api/auth/csrf"):
-            return _Resp(json.dumps({"csrfToken": "fake-csrf"}).encode(), {"content-type": "application/json"}, url)
-        if path.startswith("/api/auth/callback/credentials"):
-            if self._session_valid:
-                self._cookies.set_cookie(_session_cookie())
-                self._authed = True
-            return _Resp(json.dumps({"url": self.base_url}).encode(), {"content-type": "application/json"}, url)
-        if path.startswith("/api/auth/session"):
-            body = {"user": {"name": "tester"}} if self._authed else {}
-            return _Resp(json.dumps(body).encode(), {"content-type": "application/json"}, url)
-        if path.startswith("/library"):
-            self._library_calls += 1
-            if self._logout_first and self._library_calls == 1:
-                return _Resp(b"<html>please log in</html>", {"content-type": "text/html"}, self.base_url + "/login")
-            qs = parse.parse_qs(parse.urlparse(url).query)
-            pagenum = int((qs.get("page") or ["1"])[0])
-            q = (qs.get("q") or [""])[0].strip().lower()
-            rows = self._catalog
-            if q:
-                rows = [r for r in rows if q in r[1].lower() or q in r[2].lower()]  # title / artist
-            size = feedforge._PAGE_SIZE
-            start = (pagenum - 1) * size
-            return _Resp(_library_html(rows[start:start + size]).encode(), {"content-type": "text/html"}, url)
-        if "/download" in path and method == "POST":
-            return _Resp(json.dumps(self._download_payload).encode(), {"content-type": "application/json"}, url)
-        # External CDN (Google Drive or Dropbox): stream file bytes.
-        return _Resp(
-            [self._drive_bytes],
-            {"content-type": "application/octet-stream", "content-disposition": 'attachment; filename="song.feedpak"'},
-            url,
-        )
+        host = (parse.urlparse(url).hostname or "").lower()
+        path = parse.urlparse(url).path
+        self.calls.append((method, url))
+        if host == "feedforge.org" and path.startswith("/feedpak-covers/"):
+            # Public cover art — record the headers so tests can assert the key never rides.
+            self.cover_request_headers = dict(req.headers)
+            return _Resp(b"\x89PNG fake image", {"Content-Type": "image/png"}, url)
+        if host != "feedforge.org":
+            # External CDN (Google Drive / Dropbox / …): stream file bytes.
+            return _Resp(
+                [self._file_bytes],
+                {"content-type": "application/octet-stream",
+                 "content-disposition": 'attachment; filename="song.feedpak"'},
+                url,
+            )
+        if req.get_header("Authorization") != f"Bearer {self._valid_key}":
+            raise _http_error(url, 401, json.dumps({"ok": False, "error": "Invalid key."}).encode())
+        if self._rate_limit_times > 0:
+            self._rate_limit_times -= 1
+            raise _http_error(url, 429, b'{"ok":false,"error":"slow down"}', {"Retry-After": "0"})
+        if path == "/api/v1/songs" and method == "GET":
+            return self._songs_response(url, req)
+        if path.startswith("/api/v1/songs/") and path.endswith("/download") and method == "POST":
+            song_id = path.split("/")[-2]
+            if song_id not in {r["id"] for r in self.api_catalog}:
+                raise _http_error(url, 404, json.dumps({"ok": False, "error": "Song not found."}).encode())
+            return _Resp(json.dumps(self._download_payload).encode(), {"Content-Type": "application/json"}, url)
+        raise _http_error(url, 404, b'{"ok":false,"error":"no such route"}')
 
-    def library_pages_fetched(self):
-        return sorted({int(path.split("page=")[1].split("&")[0])
-                       for _m, path in self.calls if path.startswith("/library")})
+    def songs_requests(self) -> list[str]:
+        return [u for _m, u in self.calls if "/api/v1/songs?" in u or u.endswith("/api/v1/songs")]
 
 
 # ------------------------------------------------------------------- helpers / URL parsing
@@ -210,319 +230,6 @@ def test_drive_file_id_from_url(url, expected):
     assert is_google_drive_file_url(url) is (expected is not None)
 
 
-def test_parse_library_html_extracts_card_fields():
-    cards = parse_library_html(_library_html(FAKE_CARDS))
-
-    assert [card["song_id"] for card in cards] == [
-        "cfake000000000000000000b", "cfake000000000000000000a", "cfake000000000000000000c",
-    ]
-    bravo = cards[0]
-    assert bravo["title"] == "Song Bravo"
-    assert bravo["artist"] == "Zeta Testers"
-    assert bravo["album"] == "Fake Album Two"
-    assert bravo["tuning"] == "Drop D"
-    assert bravo["year"] == 2021
-    assert bravo["duration"] == 3 * 60 + 45  # "3:45" -> seconds
-    # HTML entity unescaped; missing facets (artist present, album/tuning absent) degrade cleanly.
-    assert cards[2]["title"] == "Song & Charlie"
-    assert cards[2]["artist"] == "Alpha Testers"
-    assert cards[2]["album"] == ""
-    assert cards[2]["duration"] is None
-
-
-def test_parse_library_html_skips_rows_without_song_title():
-    html = "<table><tbody><tr><td>not a song row</td></tr>" + _row_html(*FAKE_CARDS[0]) + "</tbody></table>"
-    cards = parse_library_html(html)
-    assert len(cards) == 1
-    assert cards[0]["song_id"] == "cfake000000000000000000b"
-
-
-# ------------------------------------------------------------------------------ login
-
-
-def test_login_drives_nextauth_handshake_and_sets_session(tmp_path):
-    provider = FakeFeedForge(tmp_path)
-    assert not provider._has_session()
-
-    provider._login()
-
-    assert provider._has_session()
-    called = [path for _method, path in provider.calls]
-    assert any(p.startswith("/api/auth/csrf") for p in called)
-    assert any(p.startswith("/api/auth/callback/credentials") for p in called)
-    assert any(p.startswith("/api/auth/session") for p in called)
-
-
-def test_login_rejects_bad_credentials(tmp_path):
-    provider = FakeFeedForge(tmp_path, session_valid=False)
-    with pytest.raises(AuthRequiredError):
-        provider._login()
-
-
-def test_missing_credentials_raise_before_any_request(tmp_path):
-    provider = FakeFeedForge(tmp_path)
-    provider.username = ""
-    with pytest.raises(AuthRequiredError):
-        provider._login()
-
-
-# -------------------------------------------------------------------- lazy query_page
-
-
-def test_query_page_returns_syncable_shape(tmp_path):
-    provider = FakeFeedForge(tmp_path, catalog=[FAKE_CARDS[0]])
-
-    song = provider.query_page(size=3)[0][0]
-
-    assert song["title"] == "Song Bravo"
-    assert song["artist"] == "Zeta Testers"
-    assert song["album"] == "Fake Album Two"
-    assert song["syncSupport"] == "syncable"
-    assert song["packageForm"] == "sloppak-zip"
-    assert song["capabilities"] == ["package-download"]
-    assert song["settingsKey"]
-    assert song["localFilename"] == ""
-
-
-def test_query_page_is_lazy_only_fetches_the_viewed_window(tmp_path):
-    # 30-song catalog (10 pages of 3); viewing page 0 must NOT scrape the whole catalog.
-    provider = FakeFeedForge(tmp_path, catalog=_cards(30))
-
-    songs, _total = provider.query_page(page=0, size=3)
-
-    assert [s["title"] for s in songs] == ["Song 000", "Song 001", "Song 002"]
-    assert provider.library_pages_fetched() == [1]  # only FeedForge page 1 fetched
-
-
-def test_query_page_maps_window_across_ff_pages(tmp_path):
-    # A core page/size that straddles two FeedForge pages fetches exactly those two.
-    provider = FakeFeedForge(tmp_path, catalog=_cards(30))
-
-    songs, _total = provider.query_page(page=1, size=4)  # songs [4..8) -> ff pages 2 and 3
-
-    assert [s["title"] for s in songs] == ["Song 004", "Song 005", "Song 006", "Song 007"]
-    assert provider.library_pages_fetched() == [2, 3]
-
-
-def test_query_page_paginates_the_whole_catalog(tmp_path):
-    provider = FakeFeedForge(tmp_path, catalog=_cards(7))
-    seen = []
-    page = 0
-    while True:
-        songs, _total = provider.query_page(page=page, size=3)
-        if not songs:
-            break
-        seen.extend(s["song_id"] for s in songs)
-        page += 1
-
-    assert len(seen) == 7 and len(set(seen)) == 7  # every song, no dupes
-
-
-def test_query_page_search_passes_q_through_server_side(tmp_path):
-    catalog = _cards(9) + [("cfakeZZZ", "Special Track", "Metallica", "Ride", "Drop D", "1984", "6:37")]
-    provider = FakeFeedForge(tmp_path, catalog=catalog)
-
-    songs, _total = provider.query_page(q="metallica", size=3)
-
-    assert [s["title"] for s in songs] == ["Special Track"]
-    # The request carried ?q=; the fake filtered server-side (we didn't scrape + filter locally).
-    assert any("q=metallica" in path for _m, path in provider.calls)
-
-
-@pytest.mark.parametrize("core_sort,expected", [
-    ("artist", "artist"),
-    ("artist-desc", "artist"),   # FeedForge has no descending direction -> the base field
-    ("title", "title"),
-    ("title-desc", "title"),
-    ("recent", "newest"),
-    ("year-desc", "newest"),     # FeedForge has no year sort -> newest (closest "newest first")
-    ("downloads", None),         # unsafe (overlapping pages) -> unmapped -> default order
-    ("nonsense", None),
-])
-def test_sort_maps_to_supported_feedforge_value(tmp_path, core_sort, expected):
-    provider = FakeFeedForge(tmp_path, catalog=_cards(3))
-    assert provider._query_params(sort=core_sort).get("sort") == expected
-
-
-def test_query_page_passes_mapped_sort_to_server(tmp_path):
-    provider = FakeFeedForge(tmp_path, catalog=_cards(3))
-    provider.query_page(sort="title-desc", size=3)
-    assert any("sort=title" in path for _m, path in provider.calls)
-
-
-def test_query_page_total_settles_at_the_end(tmp_path):
-    provider = FakeFeedForge(tmp_path, catalog=_cards(7))
-
-    _first, total_first = provider.query_page(page=0, size=3)
-    last_songs, total_last = provider.query_page(page=2, size=3)  # songs [6..9) -> only 1 left
-
-    assert total_first > 3           # at-least estimate signals a next page while more remain
-    assert len(last_songs) == 1
-    assert total_last == 7           # settles to the exact count at the end
-
-
-def test_query_page_marks_downloaded_song_as_local(tmp_path):
-    local_root = tmp_path / "dlc"
-    provider = FakeFeedForge(tmp_path / "cache", catalog=[FAKE_CARDS[0]], local_library_root=local_root)
-    name = "Zeta Testers - Song Bravo.feedpak"
-    target = local_root / provider._source_folder_name() / name
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(b"downloaded")
-
-    song = provider.query_page(size=3)[0][0]
-
-    relative = f"{provider._source_folder_name()}/{name}"
-    assert song["localFilename"] == relative
-    assert song["playFilename"] == relative
-    assert song["filename"] == relative
-
-
-def test_page_fetch_is_cached(tmp_path):
-    provider = FakeFeedForge(tmp_path, catalog=_cards(3))
-    provider.query_page(size=3)
-    provider.query_page(size=3)  # same window again
-
-    assert provider.library_pages_fetched() == [1]  # served from cache the second time
-
-
-def test_fetch_page_retries_a_transient_empty_page(tmp_path):
-    # A page that momentarily returns empty must be retried, not treated as the end.
-    provider = FakeFeedForge(tmp_path, catalog=_cards(3))
-    seq = iter(["", "", _library_html(_cards(3))])  # empty, empty, then real content
-    provider._authed_html = lambda _path: next(seq)
-
-    cards = provider._fetch_page_cards(1)
-    assert len(cards) == 3
-
-
-def test_authed_html_relogs_in_on_logout_redirect(tmp_path):
-    provider = FakeFeedForge(tmp_path, catalog=[FAKE_CARDS[0]], logout_first=True)
-
-    songs, _total = provider.query_page(size=3)
-
-    assert [s["title"] for s in songs] == ["Song Bravo"]  # bounced to /login, re-logged-in, succeeded
-    logins = [p for _m, p in provider.calls if p.startswith("/api/auth/callback")]
-    assert len(logins) >= 2
-
-
-# --------------------------------------------------- catalog total + degraded aggregates
-
-
-def test_catalog_total_binary_searches_the_size(tmp_path):
-    provider = FakeFeedForge(tmp_path, catalog=_cards(7))  # 3 pages: 3 + 3 + 1
-
-    assert provider._catalog_total() == 7
-    # Bounded probing (exponential + binary search), not a page-by-page scrape of all 3+ pages.
-    assert len(provider.library_pages_fetched()) <= 5
-
-
-def test_catalog_total_zero_for_empty_catalog(tmp_path):
-    provider = FakeFeedForge(tmp_path, catalog=[])
-    assert provider._catalog_total() == 0
-
-
-def test_describe_source_reports_type_and_total(tmp_path):
-    provider = FakeFeedForge(tmp_path, catalog=_cards(7))
-
-    info = provider.describe_source()
-
-    assert info["ok"] is True
-    assert info["songCount"] == 7
-    assert info["server"]["protocol"] == "feedforge.v1"
-
-
-def test_query_stats_reports_total_and_degrades_letters(tmp_path):
-    provider = FakeFeedForge(tmp_path, catalog=_cards(7))
-
-    stats = provider.query_stats()
-
-    assert stats["total_songs"] == 7
-    assert stats["letters"] == {}          # A-Z rail degraded (would need the full catalog)
-    assert stats["total_artists"] == 0
-
-
-def test_query_artists_is_empty(tmp_path):
-    provider = FakeFeedForge(tmp_path, catalog=_cards(7))
-    assert provider.query_artists() == ([], 0)
-
-
-# --------------------------------------------------------------------------- download
-
-
-def _browse(provider):
-    # Populate the card cache the way a real click does (browse, then sync).
-    provider.query_page(size=50)
-
-
-def test_do_sync_resolves_drive_link_and_imports(tmp_path):
-    local_root = tmp_path / "dlc"
-    local_root.mkdir()
-    imported = []
-
-    def importer(path, root):
-        imported.append(path)
-        return {"libraryImportState": "indexed", "libraryFilename": path.relative_to(root).as_posix()}
-
-    provider = FakeFeedForge(
-        tmp_path / "cache",
-        catalog=[FAKE_CARDS[0]],
-        download_payload={"ok": True, "url": "https://drive.google.com/file/d/FID12345678/view"},
-        local_library_root=local_root,
-        library_importer=importer,
-    )
-    _browse(provider)
-
-    result = provider._do_sync("cfake000000000000000000b")
-
-    assert result["ok"] is True
-    assert result["playbackSource"] == "library-folder"
-    assert result["libraryImportState"] == "indexed"
-    # Imported under the browsed card's deterministic "Artist - Title.feedpak" name.
-    assert result["localFilename"].endswith("Zeta Testers - Song Bravo.feedpak")
-    assert len(imported) == 1
-    assert any(method == "POST" and "/download" in path for method, path in provider.calls)
-
-
-def test_do_sync_handles_dropbox_url(tmp_path):
-    provider = FakeFeedForge(
-        tmp_path / "cache",
-        catalog=[FAKE_CARDS[0]],
-        download_payload={"ok": True, "url": "https://www.dropbox.com/scl/fi/x/Song.feedpak?rlkey=k&dl=0"},
-    )
-    _browse(provider)
-
-    result = provider._do_sync("cfake000000000000000000b")
-
-    assert result["ok"] is True
-    assert result["bytes"] > 0
-    assert any("dl=1" in path for _method, path in provider.calls)  # fetched the direct form
-
-
-def test_do_sync_names_file_from_url_when_not_browsed(tmp_path):
-    # Syncing a song that wasn't browsed (no cached card) still imports under a meaningful name
-    # derived from the resolved download URL.
-    local_root = tmp_path / "dlc"
-    local_root.mkdir()
-    provider = FakeFeedForge(
-        tmp_path / "cache",
-        catalog=[],
-        download_payload={"ok": True, "url": "https://www.dropbox.com/scl/fi/x/Cool-Band-Cool-Song.feedpak?dl=0"},
-        local_library_root=local_root,
-        library_importer=lambda path, root: {"libraryImportState": "indexed"},
-    )
-
-    result = provider._do_sync("some-unbrowsed-id")
-
-    assert result["localFilename"].endswith("Cool-Band-Cool-Song.feedpak")
-
-
-def test_do_sync_raises_when_no_download_url(tmp_path):
-    provider = FakeFeedForge(tmp_path / "cache", catalog=[FAKE_CARDS[0]], download_payload={"ok": False})
-    _browse(provider)
-    with pytest.raises(RuntimeError, match="download link"):
-        provider._do_sync("cfake000000000000000000b")
-
-
 @pytest.mark.parametrize("url,expect_dl1", [
     ("https://www.dropbox.com/scl/fi/abc/Song.feedpak?rlkey=k&st=s&dl=0", True),
     ("https://www.dropbox.com/scl/fi/abc/Song.feedpak?rlkey=k", True),
@@ -537,24 +244,449 @@ def test_direct_download_url_forces_dropbox_dl1(url, expect_dl1):
         assert out == url
 
 
+def test_reduce_record_tolerates_live_api_typing():
+    # fileSizeBytes is a STRING when present and null when not (verified live); year and
+    # durationSec are numbers; timestamps become floats for sorting.
+    reduced = _reduce_record(_api_song(1, fileSizeBytes="8178892"))
+    assert reduced["sizeBytes"] == 8178892
+    assert reduced["year"] == 2001
+    assert reduced["createdTs"] > 0
+
+    sparse = _reduce_record(_api_song(2, fileSizeBytes=None, year=None, durationSec=None,
+                                      album="", createdAt="", updatedAt="not-a-date"))
+    assert sparse["sizeBytes"] == 0
+    assert sparse["year"] is None
+    assert sparse["durationSec"] is None
+    assert sparse["createdTs"] == 0.0
+    assert sparse["updatedTs"] == 0.0
+
+
+# ------------------------------------------------------------------------------ auth
+
+
+def test_missing_key_raises_before_any_request(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, token="")
+    with pytest.raises(AuthRequiredError, match="access key"):
+        provider.describe_source()
+    assert provider.calls == []
+
+
+def test_legacy_credentials_source_prompts_for_key_migration(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, token="",
+                                source_extra={"username": "tester", "password": "old-secret"})
+    with pytest.raises(AuthRequiredError) as excinfo:
+        provider.describe_source()
+    assert str(excinfo.value) == KEY_MIGRATE_MESSAGE
+    assert provider.calls == []
+
+
+def test_rejected_key_raises_auth_required(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, token="ffp_wrong_key", catalog=_songs(3))
+    with pytest.raises(AuthRequiredError) as excinfo:
+        provider.describe_source()
+    assert str(excinfo.value) == KEY_REJECTED_MESSAGE
+
+
+def test_rate_limit_is_retried_once_via_retry_after(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=_songs(2), rate_limit_times=1)
+    info = provider.describe_source()
+    assert info["songCount"] == 2  # the 429 was absorbed by one Retry-After retry
+
+
+# -------------------------------------------------------------------- mirror walk + refresh
+
+
+def test_walk_builds_full_mirror_across_cursor_pages(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=_songs(7))  # 3 pages of 3 at the test limit
+
+    info = provider.describe_source()
+
+    assert info["ok"] is True
+    assert info["songCount"] == 7
+    assert info["server"]["protocol"] == "feedforge.v1"
+    walk_requests = [u for u in provider.songs_requests() if "sort=newest" in u]
+    assert len(walk_requests) == 3  # cursor-walked, one request per page
+    assert sum("cursor=" in u for u in walk_requests) == 2
+
+
+def test_mirror_persists_and_reloads_without_rewalking(tmp_path):
+    first = FakeFeedForgeAPI(tmp_path, catalog=_songs(7))
+    first.describe_source()
+    assert (first.cache_dir / "catalog.json").exists()
+
+    second = FakeFeedForgeAPI(tmp_path, catalog=_songs(7))
+    songs, total = second.query_page(size=10)
+
+    assert total == 7 and len(songs) == 7
+    # The persisted mirror was loaded; the only network was ONE updatedAfter delta (a loaded
+    # mirror counts as stale, which also revalidates the key after a restart) — no re-walk.
+    deltas = [u for u in second.songs_requests() if "updatedAfter=" in u]
+    walks = [u for u in second.songs_requests() if "sort=newest" in u]
+    assert len(deltas) == 1 and len(walks) == 0
+
+
+def test_delta_merges_new_and_changed_records(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=_songs(4))
+    provider.describe_source()
+
+    # The walk watermark is the real wall-clock walk start, so delta-visible changes must be
+    # stamped *after* it — far-future dates keep the test independent of the actual clock.
+    provider.api_catalog.append(
+        _api_song(90, createdAt="2036-01-01T00:00:00.000Z", updatedAt="2036-01-01T00:00:00.000Z"))
+    provider.api_catalog[0] = {**provider.api_catalog[0],
+                               "title": "Renamed", "updatedAt": "2036-01-02T00:00:00.000Z"}
+    with provider._mirror_lock:
+        provider._synced_at = -10_000  # force the TTL check to see a stale mirror
+
+    _songs_page, total = provider.query_page(size=10)
+
+    assert total == 5
+    assert provider._record(provider.api_catalog[0]["id"])["title"] == "Renamed"
+
+
+def test_unchanged_delta_revalidates_with_etag_304(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=_songs(3))
+    provider.describe_source()
+
+    with provider._mirror_lock:
+        provider._synced_at = -10_000
+    provider.query_page(size=5)  # empty 200 delta -> stores the ETag
+    with provider._mirror_lock:
+        provider._synced_at = -10_000
+    provider.query_page(size=5)  # same watermark -> If-None-Match -> 304
+
+    conditional = [(m, u) for m, u in provider.calls
+                   if "updatedAfter=" in u]
+    assert len(conditional) == 2
+    # The fake raises 304 only when If-None-Match matched; reaching here without error and
+    # without a third merge proves the revalidation path ran. Mirror is still intact:
+    assert provider.query_stats()["total_songs"] == 3
+
+
+def test_completed_rewalk_drops_ghost_records(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=_songs(5))
+    provider.describe_source()
+    assert provider.query_stats()["total_songs"] == 5
+
+    removed = provider.api_catalog.pop(0)  # deleted on FeedForge; updatedAfter will never say so
+    with provider._mirror_lock:
+        provider._synced_at = -10_000
+        provider._full_walk_wall = 1.0  # long past full_resync_seconds -> re-walk due
+
+    provider.query_page(size=10)
+
+    assert provider._record(removed["id"]) is None
+    assert provider.query_stats()["total_songs"] == 4
+
+
+def test_download_404_drops_the_record(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=_songs(3))
+    provider.describe_source()
+    ghost_id = provider.api_catalog.pop(0)["id"]  # still mirrored, gone upstream
+
+    with pytest.raises(SongGoneError):
+        provider._post_download(ghost_id)
+
+    assert provider._record(ghost_id) is None
+
+
+# ----------------------------------------------------------- local querying over the mirror
+
+
+def test_query_page_returns_syncable_shape(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=[_api_song(5, artist="Zeta Testers", title="Song Bravo",
+                                                             album="Fake Album Two")])
+
+    song = provider.query_page(size=3)[0][0]
+
+    assert song["title"] == "Song Bravo"
+    assert song["artist"] == "Zeta Testers"
+    assert song["album"] == "Fake Album Two"
+    assert song["syncSupport"] == "syncable"
+    assert song["packageForm"] == "sloppak-zip"
+    assert song["capabilities"] == ["package-download"]
+    assert song["settingsKey"]
+    assert song["localFilename"] == ""
+    assert song["sizeBytes"] == 1005  # from the string-typed fileSizeBytes
+    assert song["duration"] == 185
+    assert song["year"] == 2005
+
+
+def test_all_core_sorts_are_served_locally(tmp_path):
+    catalog = [
+        _api_song(0, artist="Alpha", title="Zulu Song", year=1990,
+                  createdAt="2026-06-01T00:00:00.000Z"),
+        _api_song(1, artist="Mike", title="Alpha Song", year=2020,
+                  createdAt="2026-06-03T00:00:00.000Z"),
+        _api_song(2, artist="Zeta", title="Mid Song", year=2005,
+                  createdAt="2026-06-02T00:00:00.000Z"),
+        _api_song(3, artist="Beta", title="Beta Song", year=None,
+                  createdAt="2026-06-04T00:00:00.000Z"),
+    ]
+    provider = FakeFeedForgeAPI(tmp_path, catalog=catalog)
+
+    def artists(sort, direction="asc"):
+        songs, _total = provider.query_page(size=10, sort=sort, direction=direction)
+        return [s["artist"] for s in songs]
+
+    assert artists("artist") == ["Alpha", "Beta", "Mike", "Zeta"]
+    assert artists("artist-desc") == ["Zeta", "Mike", "Beta", "Alpha"]
+    titles = [s["title"] for s in provider.query_page(size=10, sort="title-desc")[0]]
+    assert titles == ["Zulu Song", "Mid Song", "Beta Song", "Alpha Song"]
+    assert artists("recent") == ["Beta", "Mike", "Zeta", "Alpha"]  # newest added first
+    # Year-newest first; the record with no year sinks to the end (never pollutes the top).
+    years = [s["year"] for s in provider.query_page(size=10, sort="year-desc")[0]]
+    assert years == [2020, 2005, 1990, None]
+
+
+def test_search_is_local_no_query_leaves_the_process(tmp_path):
+    catalog = _songs(5) + [_api_song(50, artist="Metallica", title="Special Track")]
+    provider = FakeFeedForgeAPI(tmp_path, catalog=catalog)
+    provider.describe_source()
+    before = len(provider.songs_requests())
+
+    songs, total = provider.query_page(q="metallica", size=10)
+
+    assert total == 1
+    assert songs[0]["title"] == "Special Track"
+    assert len(provider.songs_requests()) == before  # served from the mirror, zero API calls
+    assert not any("q=" in u for u in provider.songs_requests())
+
+
+def test_stats_letters_and_artists_are_restored(tmp_path):
+    catalog = [
+        _api_song(0, artist="Alpha Band", album="One"),
+        _api_song(1, artist="Alpha Band", album="Two"),
+        _api_song(2, artist="Beta Crew"),
+        _api_song(3, artist="1st Wonder"),
+    ]
+    provider = FakeFeedForgeAPI(tmp_path, catalog=catalog)
+
+    stats = provider.query_stats()
+    assert stats["total_songs"] == 4
+    assert stats["total_artists"] == 3
+    assert stats["letters"] == {"A": 1, "B": 1, "#": 1}
+
+    artists, total = provider.query_artists(size=10)
+    assert total == 3
+    alpha = next(a for a in artists if a["name"] == "Alpha Band")
+    assert alpha["song_count"] == 2
+    assert alpha["album_count"] == 2
+    assert {album["name"] for album in alpha["albums"]} == {"One", "Two"}
+
+    only_a, total_a = provider.query_artists(letter="a", size=10)
+    assert total_a == 1 and only_a[0]["name"] == "Alpha Band"
+
+
+def test_query_page_marks_downloaded_song_as_local(tmp_path):
+    local_root = tmp_path / "dlc"
+    provider = FakeFeedForgeAPI(tmp_path / "cache",
+                                catalog=[_api_song(5, artist="Zeta Testers", title="Song Bravo")],
+                                local_library_root=local_root)
+    name = "Zeta Testers - Song Bravo.feedpak"
+    target = local_root / provider._source_folder_name() / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"downloaded")
+
+    song = provider.query_page(size=3)[0][0]
+
+    relative = f"{provider._source_folder_name()}/{name}"
+    assert song["localFilename"] == relative
+    assert song["playFilename"] == relative
+    assert song["filename"] == relative
+
+
+def test_partial_mirror_reports_at_least_total(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=_songs(4))
+    # Simulate mid-walk: some records present, walk not yet complete.
+    provider._start_catalog_walk = lambda: None
+    with provider._mirror_lock:
+        provider._records = {r["id"]: _reduce_record(r) for r in provider.api_catalog[:2]}
+        provider._mirror_complete = False
+    provider._first_page_event.set()
+
+    _songs_page, total = provider.query_page(size=10)
+
+    assert total > 2  # more is coming; the grid keeps paginating until the walk settles
+
+
+def test_mirror_completed_by_another_instance_is_adopted(tmp_path):
+    """A cold instance whose own walk never ran (or died) must pick up a mirror that another
+    instance — an earlier process, or an add-time sibling — completed and persisted, even
+    though its own first look found no file yet (the original stuck-at-50 bug)."""
+    watcher = FakeFeedForgeAPI(tmp_path, catalog=_songs(7))
+    watcher._start_catalog_walk = lambda: None  # this instance never walks
+    watcher._first_page_event.set()
+
+    songs, _total = watcher.query_page(size=10)
+    assert songs == []  # nothing local yet, and no walk of its own
+
+    sibling = FakeFeedForgeAPI(tmp_path, catalog=_songs(7))
+    sibling.describe_source()  # walks (inline) + persists the complete mirror
+
+    songs, total = watcher.query_page(size=10)
+
+    assert watcher._mirror_complete is True
+    assert total == 7 and len(songs) == 7  # adopted from disk, no walk of its own
+
+
+def test_walk_resumes_from_cursor_after_transient_failures(tmp_path):
+    """A walk that dies mid-catalog resumes from its checkpointed cursor on the next attempt
+    instead of re-fetching from page 1 (re-spending the rate-limit budget)."""
+    provider = FakeFeedForgeAPI(
+        tmp_path, catalog=_songs(7),
+        fail_cursor_pages_times=FeedForgeProvider.walk_page_attempts,  # exhaust page-2 retries
+    )
+
+    provider.describe_source()  # first walk attempt: page 1 lands, page 2 keeps failing
+
+    assert provider._mirror_complete is False
+    assert provider._walk_cursor  # checkpointed mid-catalog
+    with provider._mirror_lock:
+        provider._walk_failed_at = 0.0  # skip the cooloff; a real one just waits 60s
+
+    _songs_page, total = provider.query_page(size=10)  # second attempt resumes + completes
+
+    assert provider._mirror_complete is True
+    assert total == 7
+    first_page_walks = [
+        u for _m, u in provider.calls
+        if "sort=newest" in u and "cursor=" not in u and "limit=1" not in u
+    ]
+    assert len(first_page_walks) == 1  # page 1 was never re-fetched
+
+
+# --------------------------------------------------------------------------- artwork
+
+
+def test_get_art_fetches_cover_without_the_bearer_key(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=[_api_song(1)])
+    provider.describe_source()
+
+    response = provider.get_art(_api_song(1)["id"])
+
+    assert response is not None
+    assert provider.cover_request_headers is not None
+    assert not any(k.lower() == "authorization" for k in provider.cover_request_headers)
+    # Second call is served from the art cache (no new cover request).
+    covers_before = len([u for _m, u in provider.calls if "/feedpak-covers/" in u])
+    assert provider.get_art(_api_song(1)["id"]) is not None
+    assert len([u for _m, u in provider.calls if "/feedpak-covers/" in u]) == covers_before
+
+
+# --------------------------------------------------------------------------- download
+
+
+def test_do_sync_resolves_drive_link_and_imports(tmp_path):
+    local_root = tmp_path / "dlc"
+    local_root.mkdir()
+    imported = []
+
+    def importer(path, root):
+        imported.append(path)
+        return {"libraryImportState": "indexed", "libraryFilename": path.relative_to(root).as_posix()}
+
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache",
+        catalog=[_api_song(5, artist="Zeta Testers", title="Song Bravo")],
+        download_payload={"ok": True, "url": "https://drive.google.com/file/d/FID12345678/view"},
+        local_library_root=local_root,
+        library_importer=importer,
+    )
+    provider.describe_source()
+
+    result = provider._do_sync(_api_song(5)["id"])
+
+    assert result["ok"] is True
+    assert result["playbackSource"] == "library-folder"
+    assert result["libraryImportState"] == "indexed"
+    # Imported under the mirror record's deterministic "Artist - Title.feedpak" name.
+    assert result["localFilename"].endswith("Zeta Testers - Song Bravo.feedpak")
+    assert len(imported) == 1
+    assert any(m == "POST" and "/download" in u for m, u in provider.calls)
+
+
+def test_do_sync_handles_dropbox_url(tmp_path):
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache",
+        catalog=[_api_song(5)],
+        download_payload={"ok": True, "url": "https://www.dropbox.com/scl/fi/x/Song.feedpak?rlkey=k&dl=0"},
+    )
+    provider.describe_source()
+
+    result = provider._do_sync(_api_song(5)["id"])
+
+    assert result["ok"] is True
+    assert result["bytes"] > 0
+    assert any("dl=1" in u for _m, u in provider.calls)  # fetched the direct form
+
+
+def test_do_sync_routes_proton_links_through_the_proton_module(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_download(provider, url, fallback_filename):
+        seen["url"] = url
+        seen["filename"] = fallback_filename
+        target = provider.cache_dir / fallback_filename
+        target.write_bytes(b"PK\x03\x04proton")
+        return target, "hash", 12
+
+    monkeypatch.setattr(feedforge.proton_drive, "download_share_package", fake_download)
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache",
+        catalog=[_api_song(5, artist="Zeta Testers", title="Song Bravo")],
+        download_payload={"ok": True, "url": "https://drive.proton.me/urls/FAKETOKEN0#pw"},
+    )
+    provider.describe_source()
+
+    result = provider._do_sync(_api_song(5)["id"])
+
+    assert result["ok"] is True
+    assert seen["url"] == "https://drive.proton.me/urls/FAKETOKEN0#pw"
+    assert seen["filename"] == "Zeta Testers - Song Bravo.feedpak"
+
+
+def test_do_sync_proton_without_native_deps_degrades_clearly(tmp_path, monkeypatch):
+    def raising(*_args, **_kwargs):
+        raise ImportError("No module named 'pysequoia'")
+
+    monkeypatch.setattr(feedforge.proton_drive, "download_share_package", raising)
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache",
+        catalog=[_api_song(5)],
+        download_payload={"ok": True, "url": "https://drive.proton.me/urls/FAKETOKEN0#pw"},
+    )
+    provider.describe_source()
+
+    with pytest.raises(RuntimeError, match="bcrypt \\+ pysequoia"):
+        provider._do_sync(_api_song(5)["id"])
+
+
+def test_do_sync_raises_when_no_download_url(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path / "cache", catalog=[_api_song(5)], download_payload={"ok": False})
+    provider.describe_source()
+    with pytest.raises(RuntimeError, match="download link"):
+        provider._do_sync(_api_song(5)["id"])
+
+
 def test_sync_song_is_non_blocking_then_plays(tmp_path):
     local_root = tmp_path / "dlc"
     local_root.mkdir()
-    provider = FakeFeedForge(
+    provider = FakeFeedForgeAPI(
         tmp_path / "cache",
-        catalog=[FAKE_CARDS[0]],
+        catalog=[_api_song(5, artist="Zeta Testers", title="Song Bravo")],
         download_payload={"ok": True, "url": "https://drive.google.com/file/d/FID12345678/view"},
         local_library_root=local_root,
         library_importer=lambda path, root: {"libraryImportState": "indexed"},
     )
-    _browse(provider)
+    provider.describe_source()
     provider._start_background_sync = provider._background_sync  # run inline, deterministically
 
-    first = provider.sync_song("cfake000000000000000000b")
+    first = provider.sync_song(_api_song(5)["id"])
     assert first["cacheState"] == "downloading"
     assert "filename" not in first
 
-    second = provider.sync_song("cfake000000000000000000b")
+    second = provider.sync_song(_api_song(5)["id"])
     assert second["playbackSource"] == "library-folder"
     assert second["localFilename"].endswith("Zeta Testers - Song Bravo.feedpak")
 
@@ -562,23 +694,23 @@ def test_sync_song_is_non_blocking_then_plays(tmp_path):
 def test_active_downloads_reports_downloading_then_ready(tmp_path):
     local_root = tmp_path / "dlc"
     local_root.mkdir()
-    provider = FakeFeedForge(
+    provider = FakeFeedForgeAPI(
         tmp_path / "cache",
-        catalog=[FAKE_CARDS[0]],
+        catalog=[_api_song(5, artist="Zeta Testers", title="Song Bravo")],
         download_payload={"ok": True, "url": "https://drive.google.com/file/d/FID12345678/view"},
         local_library_root=local_root,
         library_importer=lambda path, root: {"libraryImportState": "indexed"},
     )
-    _browse(provider)
+    provider.describe_source()
     provider._start_background_sync = lambda song_id: None  # hold in the downloading state
 
-    provider.sync_song("cfake000000000000000000b")
+    provider.sync_song(_api_song(5)["id"])
     downloading = provider.active_downloads()
     assert downloading[0]["status"] == "downloading"
     assert downloading[0]["providerId"] == provider.id
-    assert downloading[0]["title"]
+    assert downloading[0]["title"] == "Zeta Testers – Song Bravo"
 
-    provider._background_sync("cfake000000000000000000b")
+    provider._background_sync(_api_song(5)["id"])
     ready = provider.active_downloads()
     assert ready[0]["status"] == "ready"
     assert ready[0]["localFilename"].endswith("Zeta Testers - Song Bravo.feedpak")
@@ -587,37 +719,61 @@ def test_active_downloads_reports_downloading_then_ready(tmp_path):
 # ------------------------------------------------------------------------- route wiring
 
 
-def _stub_network(monkeypatch, *, catalog=None, raise_auth=False):
-    catalog = catalog if catalog is not None else _cards(7)
+def _stub_api(monkeypatch, *, catalog=None, raise_auth=False):
+    catalog = catalog if catalog is not None else _songs(7)
+    api_calls: list[dict] = []
 
-    def fake_authed_html(self, path):
+    def fake_api_get(self, path, params=None, *, etag="", timeout=30.0, retry_after_cap=None):
+        api_calls.append(dict(params or {}))
         if raise_auth:
-            raise AuthRequiredError("FeedForge rejected the username or password")
-        qs = parse.parse_qs(parse.urlparse(path).query)
-        pagenum = int((qs.get("page") or ["1"])[0])
-        size = feedforge._PAGE_SIZE
-        return _library_html(catalog[(pagenum - 1) * size:pagenum * size])
+            raise AuthRequiredError(KEY_REJECTED_MESSAGE)
+        params = params or {}
+        rows = sorted(catalog, key=lambda r: r["createdAt"], reverse=True)
+        if params.get("updatedAfter"):
+            rows = [r for r in rows if r["updatedAt"] > params["updatedAfter"]]
+        limit = int(params.get("limit") or 50)
+        start = 0
+        cursor = params.get("cursor") or ""
+        if cursor:
+            ids = [r["id"] for r in rows]
+            start = ids.index(cursor) + 1 if cursor in ids else len(rows)
+        page = rows[start:start + limit]
+        has_more = start + limit < len(rows)
+        return {
+            "ok": True,
+            "data": page,
+            "pagination": {"limit": limit,
+                           "nextCursor": page[-1]["id"] if (page and has_more) else None,
+                           "hasMore": has_more},
+        }, 'W/"stub"'
 
-    monkeypatch.setattr(FeedForgeProvider, "_ensure_session", lambda self: None)
-    monkeypatch.setattr(FeedForgeProvider, "_authed_html", fake_authed_html)
-    monkeypatch.setattr(FeedForgeProvider, "empty_page_backoff_seconds", 0)
+    monkeypatch.setattr(FeedForgeProvider, "_api_get", fake_api_get)
+    monkeypatch.setattr(FeedForgeProvider, "_start_catalog_walk", FeedForgeProvider._walk_catalog)
+    return api_calls
 
 
-def test_add_feedforge_source_registers_and_hides_password(tmp_path, monkeypatch):
+def _setup_routes(tmp_path, registered=None):
     routes = importlib.reload(importlib.import_module("routes"))
-    _stub_network(monkeypatch)
-    registered = {}
     app = FastAPI()
     routes.setup(app, {
         "config_dir": tmp_path / "config",
-        "register_library_provider": lambda provider, replace=False: registered.setdefault(provider.id, provider),
+        "register_library_provider": (
+            (lambda provider, replace=False: registered.setdefault(provider.id, provider))
+            if registered is not None else (lambda provider, replace=False: None)
+        ),
         "get_sloppak_cache_dir": lambda: tmp_path / "cache",
         "get_dlc_dir": lambda: None,
     })
-    client = TestClient(app)
+    return routes, TestClient(app)
+
+
+def test_add_feedforge_source_with_key_registers_and_hides_it(tmp_path, monkeypatch):
+    _stub_api(monkeypatch)
+    registered = {}
+    _routes, client = _setup_routes(tmp_path, registered)
 
     added = client.post("/api/plugins/remote_library_client/sources", json={
-        "type": "feedforge.v1", "username": "tester", "password": "s3cret", "label": "My FeedForge",
+        "type": "feedforge.v1", "token": FAKE_KEY, "label": "My FeedForge",
     })
     status = client.get("/api/plugins/remote_library_client/status")
 
@@ -625,31 +781,109 @@ def test_add_feedforge_source_registers_and_hides_password(tmp_path, monkeypatch
     source = added.json()["source"]
     assert source["type"] == "feedforge.v1"
     assert source["songCount"] == 7
-    assert source["username"] == "tester"
-    assert "password" not in source  # the secret never surfaces
-    assert source["hasPassword"] is True
+    assert "token" not in source  # the key is a secret and never surfaces
+    assert source["hasToken"] is True
+    assert source["accountSeed"]
     provider_id = added.json()["provider"]["id"]
     assert provider_id.startswith("feedforge:")
     assert provider_id in registered
     feedforge_status = [item for item in status.json()["sources"] if item.get("type") == "feedforge.v1"]
     assert feedforge_status and feedforge_status[0]["online"] is True
-    assert "password" not in feedforge_status[0]
+    assert "token" not in feedforge_status[0]
 
 
-def test_add_feedforge_rejects_bad_credentials_with_401(tmp_path, monkeypatch):
-    routes = importlib.reload(importlib.import_module("routes"))
-    _stub_network(monkeypatch, raise_auth=True)
-    app = FastAPI()
-    routes.setup(app, {
-        "config_dir": tmp_path / "config",
-        "register_library_provider": lambda provider, replace=False: None,
-        "get_sloppak_cache_dir": lambda: tmp_path / "cache",
-        "get_dlc_dir": lambda: None,
-    })
-    client = TestClient(app)
+def test_add_registers_the_instance_that_walked(tmp_path, monkeypatch):
+    """The provider registered for core browsing must be the SAME instance whose describe
+    walked the catalog — a second cold instance is exactly the stuck-at-50 split-brain bug."""
+    api_calls = _stub_api(monkeypatch)
+    registered = {}
+    _routes, client = _setup_routes(tmp_path, registered)
 
     added = client.post("/api/plugins/remote_library_client/sources", json={
-        "type": "feedforge.v1", "username": "tester", "password": "wrong",
+        "type": "feedforge.v1", "token": FAKE_KEY,
+    })
+    provider = registered[added.json()["provider"]["id"]]
+
+    assert provider._mirror_complete is True  # the registered instance holds the walked mirror
+    calls_before = len(api_calls)
+    songs, total = provider.query_page(size=10)
+    assert total == 7 and len(songs) == 7
+    assert len(api_calls) == calls_before  # served from its own mirror — no cold re-walk
+
+
+def test_status_reports_syncing_while_walk_incomplete(tmp_path, monkeypatch):
+    _stub_api(monkeypatch)
+    # Freeze the walk before it starts: the mirror stays incomplete, as mid-walk in real life.
+    monkeypatch.setattr(FeedForgeProvider, "_start_catalog_walk", lambda self: None)
+    monkeypatch.setattr(FeedForgeProvider, "describe_wait_seconds", 0.0)
+    _routes, client = _setup_routes(tmp_path, registered={})
+
+    added = client.post("/api/plugins/remote_library_client/sources", json={
+        "type": "feedforge.v1", "token": FAKE_KEY,
+    })
+    status = client.get("/api/plugins/remote_library_client/status").json()["sources"]
+
+    assert added.status_code == 200
+    card = next(item for item in status if item.get("type") == "feedforge.v1")
+    assert "Syncing" in card["message"]
+    assert card["online"] is True
+
+
+def test_add_feedforge_without_key_is_401_with_guidance(tmp_path, monkeypatch):
+    _stub_api(monkeypatch)
+    _routes, client = _setup_routes(tmp_path)
+
+    added = client.post("/api/plugins/remote_library_client/sources", json={"type": "feedforge.v1"})
+
+    assert added.status_code == 401
+    assert "access key" in added.json()["detail"]
+
+
+def test_add_feedforge_rejected_key_is_401(tmp_path, monkeypatch):
+    _stub_api(monkeypatch, raise_auth=True)
+    _routes, client = _setup_routes(tmp_path)
+
+    added = client.post("/api/plugins/remote_library_client/sources", json={
+        "type": "feedforge.v1", "token": "ffp_bad",
     })
 
     assert added.status_code == 401
+
+
+def test_legacy_credentials_source_migrates_to_a_key(tmp_path, monkeypatch):
+    """A stored pre-API source (username/password) prompts for a key on status, keeps its
+    providerId through the PATCH that supplies one, and sheds the obsolete password."""
+    _stub_api(monkeypatch)
+    routes, client = _setup_routes(tmp_path, registered={})
+    legacy = {
+        "type": "feedforge.v1",
+        "providerId": "feedforge:legacy:abc123",
+        "baseUrl": "https://feedforge.org",
+        "username": "tester",
+        "password": "old-secret",
+        "label": "My FeedForge",
+        "enabled": True,
+    }
+    routes._store.upsert_source(legacy)
+
+    status = client.get("/api/plugins/remote_library_client/status").json()["sources"]
+    card = next(item for item in status if item.get("providerId") == "feedforge:legacy:abc123")
+    assert card["authRequired"] is True
+    assert "access keys" in card["message"]
+    assert "password" not in card and "token" not in card
+
+    patched = client.patch(
+        "/api/plugins/remote_library_client/sources/feedforge%3Alegacy%3Aabc123",
+        json={"token": FAKE_KEY},
+    )
+    assert patched.status_code == 200
+
+    status = client.get("/api/plugins/remote_library_client/status").json()["sources"]
+    card = next(item for item in status if item.get("providerId") == "feedforge:legacy:abc123")
+    assert card["online"] is True
+    assert card["hasToken"] is True
+    assert card["songCount"] == 7
+    stored = next(item for item in routes._store.list_sources()
+                  if item.get("providerId") == "feedforge:legacy:abc123")
+    assert "password" not in stored  # the obsolete secret is dropped at migration
+    assert stored["username"] == "tester"  # kept for the label; not a secret

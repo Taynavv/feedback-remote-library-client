@@ -47,11 +47,11 @@
         return document.getElementById('rlc-type')?.value || 'google-drive-public.v1';
     }
 
-    // Per-type add form: the Access token field only applies to a Remote Library Server, so
-    // hide it (and re-label the URL field) for Google Drive / Proton Drive. Proton's password
-    // travels inside the share link itself (the #fragment), so it needs no separate field.
-    // FeedForge instead needs a username + password (credentials login), and its URL is optional
-    // (defaults to feedforge.org).
+    // Per-type add form: the Access token field applies to a Remote Library Server (optional
+    // bearer token), iroh (same protocol), and FeedForge (a required `ffp_` access key from
+    // Profile -> Connected apps) — relabeled per type. It hides for Google Drive / Proton
+    // Drive; Proton's password travels inside the share link itself (the #fragment).
+    // FeedForge's URL is optional (defaults to feedforge.org).
     function applyTypeUI() {
         const type = selectedSourceType();
         const isDirect = type === 'slopsmith-direct-library.v1';
@@ -59,10 +59,15 @@
         const isIroh = type === 'iroh-library.v1';
         const isFeedforge = type === 'feedforge.v1';
         const tokenRow = document.getElementById('rlc-token-row');
-        // iroh speaks the same protocol as the direct server, so it uses the same optional token.
-        if (tokenRow) tokenRow.classList.toggle('hidden', !(isDirect || isIroh));
-        const credentialsRow = document.getElementById('rlc-credentials-row');
-        if (credentialsRow) credentialsRow.classList.toggle('hidden', !isFeedforge);
+        if (tokenRow) tokenRow.classList.toggle('hidden', !(isDirect || isIroh || isFeedforge));
+        const tokenLabel = document.getElementById('rlc-token-label');
+        if (tokenLabel) tokenLabel.innerHTML = isFeedforge
+            ? 'FeedForge access key'
+            : 'Access token <span class="normal-case text-gray-600">(only if the server requires one)</span>';
+        const tokenInput = document.getElementById('rlc-token');
+        if (tokenInput) tokenInput.placeholder = isFeedforge ? 'ffp_…' : 'Leave blank if the server is open';
+        const tokenHint = document.getElementById('rlc-token-hint');
+        if (tokenHint) tokenHint.classList.toggle('hidden', !isFeedforge);
         const urlLabel = document.getElementById('rlc-base-url-label');
         if (urlLabel) urlLabel.textContent = isDirect ? 'Server URL'
             : isProton ? 'Proton share link'
@@ -103,13 +108,9 @@
         const baseUrl = document.getElementById('rlc-base-url');
         const label = document.getElementById('rlc-label');
         const token = document.getElementById('rlc-token');
-        const username = document.getElementById('rlc-username');
-        const password = document.getElementById('rlc-password');
         if (baseUrl) baseUrl.value = '';
         if (label) label.value = '';
         if (token) token.value = '';
-        if (username) username.value = '';
-        if (password) password.value = '';
     }
 
     function normalizeBaseUrl(value) {
@@ -334,6 +335,11 @@
             const sourceType = source.type || 'slopsmith-direct-library.v1';
             const isDirect = sourceType === 'slopsmith-direct-library.v1';
             const isIroh = sourceType === 'iroh-library.v1';
+            const isFeedforge = sourceType === 'feedforge.v1';
+            // FeedForge calls its bearer secret an "access key"; the direct/iroh server calls
+            // it an "access token". Same storage + editor, different words on the card.
+            const secretNoun = isFeedforge ? 'key' : 'token';
+            const secretLabel = isFeedforge ? 'Key' : 'Token';
             const typeBadge = sourceType === 'google-drive-public.v1'
                 ? '<span class="rounded-full border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 text-sky-300">Google Drive</span>'
                 : sourceType === 'proton-public.v1'
@@ -357,12 +363,15 @@
             const refreshLabel = busyMode === 'refresh' ? 'Refreshing source' : 'Refresh source';
             const removeLabel = busyMode === 'remove' ? 'Removing source' : 'Remove source';
             const tokenLabel = busyMode === 'token'
-                ? 'Saving access token'
-                : source.hasToken ? 'Change or clear access token' : 'Set access token';
+                ? `Saving access ${secretNoun}`
+                : source.hasToken ? `Change or clear access ${secretNoun}` : `Set access ${secretNoun}`;
             const editing = state.tokenEditor === source.providerId;
+            const tokenPlaceholder = source.hasToken
+                ? `Enter a new ${secretNoun} (leave blank to clear)`
+                : (isFeedforge ? 'ffp_…' : 'Access token');
             const tokenEditorHtml = editing ? `
                 <form data-rlc-token-form="${esc(source.providerId)}" class="mt-3 flex flex-wrap items-center gap-2 border-t border-gray-800/50 pt-3">
-                    <input id="rlc-token-input" type="password" autocomplete="off" placeholder="${source.hasToken ? 'Enter a new token (leave blank to clear)' : 'Access token'}" class="min-w-[12rem] flex-1 rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent/50" style="background:#0f172a;color:#f8fafc;" ${busy ? 'disabled' : ''} />
+                    <input id="rlc-token-input" type="password" autocomplete="off" placeholder="${esc(tokenPlaceholder)}" class="min-w-[12rem] flex-1 rounded-lg border border-gray-800 bg-dark-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent/50" style="background:#0f172a;color:#f8fafc;" ${busy ? 'disabled' : ''} />
                     <button type="submit" class="rounded-lg bg-accent px-3 py-2 text-sm font-semibold text-white transition hover:bg-accent-light ${busy ? 'opacity-60 cursor-not-allowed' : ''}" ${busy ? 'disabled' : ''}>${busyMode === 'token' ? 'Saving...' : 'Save'}</button>
                     ${source.hasToken ? `<button type="button" data-rlc-token-clear="${esc(source.providerId)}" class="rounded-lg bg-dark-600 px-3 py-2 text-sm text-gray-300 transition hover:bg-dark-500 hover:text-white ${busy ? 'opacity-60 cursor-not-allowed' : ''}" ${busy ? 'disabled' : ''}>Clear</button>` : ''}
                     <button type="button" data-rlc-token-cancel class="rounded-lg bg-dark-600 px-3 py-2 text-sm text-gray-300 transition hover:bg-dark-500 hover:text-white" ${busy ? 'disabled' : ''}>Cancel</button>
@@ -378,7 +387,7 @@
                             <span>${esc(source.songCount || 0)} songs</span>
                             ${typeBadge}
                             ${source.namToneSyncAvailable ? '<span class="rounded-full border border-gray-700 bg-dark-800 px-2 py-0.5 text-gray-300">NAM tones available</span>' : ''}
-                            ${source.authRequired && !source.hasToken ? '<span class="rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-red-300">Token required</span>' : (source.hasToken ? '<span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-amber-300">Token set</span>' : '')}
+                            ${source.authRequired && !source.hasToken ? `<span class="rounded-full border border-red-500/30 bg-red-500/10 px-2 py-0.5 text-red-300">${secretLabel} required</span>` : (source.hasToken ? `<span class="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-amber-300">${secretLabel} set</span>` : '')}
                         </div>
                         ${(isDirect || isIroh) ? `<label class="mt-3 flex w-fit items-center gap-2 text-xs text-gray-300 ${busy ? 'opacity-60' : ''}" title="${esc(namToneLabel)}">
                             <input type="checkbox" class="h-4 w-4 rounded border-gray-700 bg-dark-800" data-rlc-sync-nam-source="${esc(source.providerId)}" ${syncNamToneAssets ? 'checked' : ''} ${busy ? 'disabled' : ''} />
@@ -392,7 +401,7 @@
                     </div>
                     <div class="flex flex-shrink-0 flex-wrap gap-2">
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg ${enabled ? 'bg-green-900/40 text-green-200 hover:bg-green-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-toggle-source="${esc(source.providerId)}" data-rlc-enabled="${enabled ? 'true' : 'false'}" aria-label="${esc(toggleLabel)}" title="${esc(toggleLabel)}" aria-pressed="${enabled ? 'true' : 'false'}" ${busy ? 'disabled' : ''}>${powerIcon(enabled)}</button>
-                        ${(isDirect || isIroh) ? `<button class="flex h-10 w-10 items-center justify-center rounded-lg ${source.hasToken ? 'bg-amber-900/40 text-amber-200 hover:bg-amber-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-token="${esc(source.providerId)}" data-rlc-has-token="${source.hasToken ? 'true' : 'false'}" aria-label="${esc(tokenLabel)}" title="${esc(tokenLabel)}" ${busy ? 'disabled' : ''}>${keyIcon()}</button>` : ''}
+                        ${(isDirect || isIroh || isFeedforge) ? `<button class="flex h-10 w-10 items-center justify-center rounded-lg ${source.hasToken ? 'bg-amber-900/40 text-amber-200 hover:bg-amber-900/60' : 'bg-dark-600 text-gray-300 hover:bg-dark-500 hover:text-white'} transition ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-token="${esc(source.providerId)}" data-rlc-has-token="${source.hasToken ? 'true' : 'false'}" aria-label="${esc(tokenLabel)}" title="${esc(tokenLabel)}" ${busy ? 'disabled' : ''}>${keyIcon()}</button>` : ''}
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-dark-500 hover:text-white ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-refresh-source="${esc(source.providerId)}" aria-label="${esc(refreshLabel)}" title="${esc(refreshLabel)}" ${busy ? 'disabled' : ''}>${refreshIcon(busyMode === 'refresh')}</button>
                         <button class="flex h-10 w-10 items-center justify-center rounded-lg bg-dark-600 text-gray-300 transition hover:bg-red-900/50 hover:text-red-300 ${busy ? 'opacity-60 cursor-not-allowed' : ''}" data-rlc-remove="${esc(source.providerId)}" aria-label="${esc(removeLabel)}" title="${esc(removeLabel)}" ${busy ? 'disabled' : ''}>${removeIcon()}</button>
                     </div>
@@ -422,11 +431,9 @@
         const isFeedforge = type === 'feedforge.v1';
         const baseUrl = normalizeBaseUrl(document.getElementById('rlc-base-url')?.value || '');
         const label = document.getElementById('rlc-label')?.value.trim() || '';
-        const token = (isDirect || isIroh) ? (document.getElementById('rlc-token')?.value.trim() || '') : '';
-        const username = isFeedforge ? (document.getElementById('rlc-username')?.value.trim() || '') : '';
-        const password = isFeedforge ? (document.getElementById('rlc-password')?.value || '') : '';
+        const token = (isDirect || isIroh || isFeedforge) ? (document.getElementById('rlc-token')?.value.trim() || '') : '';
         if (isFeedforge) {
-            if (!username || !password) throw new Error('Enter your FeedForge username and password.');
+            if (!token) throw new Error('Paste your FeedForge access key (create one at feedforge.org under Profile → Connected apps).');
         } else if (!baseUrl) {
             throw new Error(isDirect
                 ? 'Enter a server URL or hostname (for example: studio.local).'
@@ -441,22 +448,20 @@
         setMessage('Adding source...', 'neutral');
         try {
             const body = { type, baseUrl, label };
-            if ((isDirect || isIroh) && token) body.token = token;
-            if (isFeedforge) { body.username = username; body.password = password; }
+            if (token) body.token = token;
             let result;
             try {
                 result = await api('/sources', { method: 'POST', body: JSON.stringify(body) });
             } catch (error) {
                 if (error.status !== 401) throw error;
                 if (isFeedforge) {
-                    setMessage('FeedForge rejected that username or password. Check them and click Add again.', 'error');
-                    document.getElementById('rlc-password')?.focus();
+                    setMessage('FeedForge rejected that access key. Create a new one under Profile → Connected apps and try again.', 'error');
                 } else {
                     setMessage(token
                         ? 'The access token was rejected. Check it and click Add again.'
                         : 'This server requires an access token. Enter it in the Access token field and click Add again.', 'error');
-                    document.getElementById('rlc-token')?.focus();
                 }
+                document.getElementById('rlc-token')?.focus();
                 return;
             }
             const added = result?.source || { baseUrl, label: label || baseUrl, online: false, songCount: 0 };
