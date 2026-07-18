@@ -12,17 +12,20 @@ API** (see ``FeedForge-Plugin-API-Guide.md``; live-verified 2026-07-16):
    prohibits collecting credentials, and keys also work for Discord-login accounts;
 2. the catalog is held as a **local mirror**: one paced, cursor-paginated walk of
    ``GET /api/v1/songs`` (the guide's recommended sync model), then incremental
-   ``updatedAfter`` deltas with ``ETag``/304 revalidation. Browsing, search, sorting, the A-Z
-   letter rail, artist browsing, and totals are all served locally from the mirror — including
-   the descending and year sorts the server itself does not offer;
+   ``updatedAfter`` deltas — and removals from the ``GET /api/v1/deletions`` tombstone feed —
+   with ``ETag``/304 revalidation. Browsing, search, sorting, the A-Z letter rail, artist
+   browsing, and totals are all served locally from the mirror — including the descending and
+   year sorts the server itself does not offer;
 3. downloads stay resolve-then-fetch: ``POST /api/v1/songs/{id}/download`` -> ``{ok, url}``
    (an external link — Google Drive, Dropbox, or a Proton Drive share in the wild), streamed
-   into the local cache by the matching host path.
+   into the local cache by the matching host path;
+4. ``GET /api/v1/me`` validates the key on first contact and supplies the account identity
+   (default source labels) and the key's expiry (a card warning 30 days ahead).
 
 Rate limits are documented (catalog: 60/min, 2000/day; downloads: 20/min, 500/day), so the
 walk is paced ~1 page/1.2s and refreshes are incremental; a 429 honors ``Retry-After`` once.
-Deletions never appear in ``updatedAfter`` deltas, so a periodic full re-walk reconciles
-ghosts (and a 404 on download drops the record immediately).
+The monthly full re-walk backstops the deletions feed (which only covers removals recorded
+after it deployed); a 404 on download still drops the record immediately.
 
 Stdlib-only, like the Google Drive type — the Proton-hosted download path reuses
 :mod:`remote_library_client.proton_drive`, whose native deps (``bcrypt`` + ``pysequoia``)
@@ -297,10 +300,10 @@ class FeedForgeProvider(BaseLibraryProvider):
         # label, and its presence without a key selects the "migrate to access keys" message.
         self.username = str(source.get("username") or "").strip()
         self._legacy_credentials = bool(source.get("password")) or bool(self.username and not self.token)
-        # The API has no whoami endpoint, so an account has no derivable identity (raised with
-        # the FeedForge dev). A per-source random seed (minted at add time) keeps providerId —
-        # and the local import folder — stable across key rotations and distinct across
-        # accounts; legacy sources keep their username-derived identity.
+        # providerId stays anchored to a per-source random seed (minted at add time), NOT the
+        # /me account identity: the seed keeps providerId — and the local import folder —
+        # stable across key rotations, and distinct across accounts. /me's username is
+        # display-only (labels); legacy sources keep their username-derived identity.
         ident = str(source.get("accountSeed") or "").strip() or self.username
         self._account_key = sanitize_filename(f"{host}_{ident}" if ident else host, "feedforge")
         provider_id = str(

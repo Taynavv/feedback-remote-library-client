@@ -425,10 +425,10 @@ def _feedforge_source(seed: dict, provider: BaseLibraryProvider | None = None) -
         legacy = bool(seed.get("password") or seed.get("username"))
         raise AuthRequiredError(KEY_MIGRATE_MESSAGE if legacy else KEY_REQUIRED_MESSAGE)
     host = parse.urlparse(base_url).hostname or "feedforge.org"
-    # The v1 API exposes no account identity (no whoami endpoint — raised with the FeedForge
-    # dev), so mint a per-source random seed once: it keeps providerId (and the local import
-    # folder) stable across key rotations, and two different accounts distinct. Legacy sources
-    # keep their username-derived providerId.
+    # providerId is anchored to a per-source random seed minted once at add time — NOT the
+    # /me account identity, which is display-only (labels). The seed keeps providerId (and
+    # the local import folder) stable across key rotations, and two different accounts
+    # distinct. Legacy sources keep their username-derived providerId.
     account_seed = str(seed.get("accountSeed") or "").strip()
     if not account_seed and not seed.get("providerId"):
         account_seed = secrets.token_hex(4)
