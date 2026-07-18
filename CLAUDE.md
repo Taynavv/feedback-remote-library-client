@@ -197,9 +197,15 @@ anonymous end-to-end-encrypted Proton Drive public share of package files.
   CDNs. Legacy credentials-era sources (stored username/password, no key) surface `authRequired` with
   `KEY_MIGRATE_MESSAGE`; the obsolete `password` is dropped from the store the moment a key takes over
   (keep `password` in the `_public_source` strip list anyway for not-yet-migrated stores). The
-  `username` is kept — it's only a label. The v1 API has **no whoami endpoint**, so new sources mint a
-  random `accountSeed` for a stable providerId/import-folder across key rotations (legacy sources keep
-  their username-derived id).
+  `username` is kept — it's only a label. **`GET /api/v1/me` is the first-contact probe** (validates
+  the key fast, before any walk) and the identity/expiry source: the account username feeds *default*
+  labels ("FeedForge (username)" — a user-typed label is never touched; routes' `default_labels` set
+  decides which is which) and is stored as `username`; the key's `expiresAt` drives a card warning
+  starting `KEY_EXPIRY_WARNING_DAYS` (30) out (`key_expiry_message`, TTL-refreshed with the mirror,
+  best-effort on polls except a 401 which must surface). **providerId stays `accountSeed`-anchored** —
+  /me identity is display-only; re-deriving ids from the username would churn provider ids and import
+  folders on re-key (the split-brain lesson). New sources still mint a random `accountSeed` (legacy
+  sources keep their username-derived id).
 - **The catalog is a persisted local mirror — walk once, delta forever (the guide's own model).**
   The initial sync is one **paced cursor walk** of `GET /api/v1/songs?sort=newest&limit=50`
   (`walk_pace_seconds = 1.2` keeps ~50 req/min under the documented 60/min catalog limit; ~4.6k songs
@@ -211,9 +217,14 @@ anonymous end-to-end-encrypted Proton Drive public share of package files.
   `metadata_cache_ttl_seconds = 900` and the provider being **reused across status polls** (same
   rationale as Proton). The mirror persists to `<cache>/catalog.json` (~1.5MB for 4.6k songs) and
   reloads on restart as complete-but-stale → the first use delta-refreshes, which also revalidates the
-  key. **Deletions never appear in `updatedAfter`** — a completed re-walk (`full_resync_seconds`, 7
-  days) is what reconciles ghosts, plus an immediate drop on a download 404 (`SongGoneError`).
-  `fileSizeBytes` arrives as a JSON **string** (BigInt-serialized) — `_reduce_record` tolerates both.
+  key. **Deletions ride the tombstone feed**: every delta refresh also polls
+  `GET /api/v1/deletions?deletedAfter=<deletionsWatermark>` (same cursor/ETag pattern; watermark set
+  to the walk start at completion, persisted as `deletionsWatermark`, parsed defensively since the
+  live feed was empty when verified) and drops the ids from the mirror; a download 404 still drops
+  immediately (`SongGoneError`). The full re-walk (`full_resync_seconds`, now 30 days) stays as the
+  backstop for missed tombstones and the pre-feature gap (the feed only covers removals recorded
+  after it deployed). `fileSizeBytes` arrives as a JSON **string** (BigInt-serialized) —
+  `_reduce_record` tolerates both.
   **One provider instance, always**: routes must register the SAME instance whose `describe_source`
   ran (`_feedforge_source` returns `(source, provider)`; `_register_provider_instance`) — a second
   cold instance is the "stuck at 50 songs / empty browse" split-brain bug (an unregistered throwaway
@@ -232,10 +243,12 @@ anonymous end-to-end-encrypted Proton Drive public share of package files.
   catalog validation is strict**: unknown `sort`/short `q` → HTTP 400 `{"ok":false,"error":…}`, so
   never pass core params through unmapped. A 429 honors `Retry-After` once (capped
   `max_retry_after_seconds`); walk failures cool off `walk_retry_seconds` before retrying.
-- **Cloudflare fronts the key-authed API too — the browser UA is load-bearing.** The managed challenge
-  403s (`Cf-Mitigated: challenge`) unfamiliar TLS/UA fingerprints *even with a valid key* (curl is
-  blocked; urllib + the Chrome UA passes, verified live). Keep `_USER_AGENT` browser-shaped; raised
-  with the FeedForge dev as an exemption request for `/api/v1/*`.
+- **The User-Agent is HONEST now — never reintroduce the browser masquerade.** The FeedForge dev
+  exempted API clients from Cloudflare's managed challenge (2026-07-18, verified live), so
+  `_USER_AGENT` identifies the plugin truthfully (`feedback-remote-library-client/<version> (+repo
+  URL)`, version read from `plugin.json`). If Cloudflare ever challenges it again (`Cf-Mitigated`
+  on a 403), `_api_error` fails loudly with `CLOUDFLARE_BLOCKED_MESSAGE` — the dev asked to be told
+  about firewall regressions; do not add a browser-UA fallback that would mask them.
 - **FeedForge hosts nothing — download is resolve-then-fetch with THREE host paths (all live-verified).**
   `sync_song` is non-blocking (same ~250ms core cap and background machinery as Google/Proton; the
   screen's click handler + `/downloads` poller treat `feedforge:` ids like `gdrive:`). `_do_sync` POSTs

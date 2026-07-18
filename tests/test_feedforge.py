@@ -100,7 +100,9 @@ class FakeFeedForgeAPI(FeedForgeProvider):
 
     def __init__(self, cache_dir, *, catalog=None, token=FAKE_KEY, download_payload=None,
                  file_bytes=b"PK\x03\x04fake-package", rate_limit_times=0,
-                 fail_cursor_pages_times=0, source_extra=None, **kwargs):
+                 fail_cursor_pages_times=0, me_username="fakeuser",
+                 me_expires_at="2036-01-01T00:00:00.000Z", deleted=None, cf_block=False,
+                 source_extra=None, **kwargs):
         source = {
             "baseUrl": "https://feedforge.org",
             "token": token,
@@ -117,7 +119,14 @@ class FakeFeedForgeAPI(FeedForgeProvider):
         # Fail this many cursor-bearing walk requests (page 2+) with a 500 — exercises the
         # walk's per-page retries and resume-from-cursor.
         self._fail_cursor_pages_times = fail_cursor_pages_times
+        self.me_username = me_username
+        self.me_expires_at = me_expires_at
+        # Tombstones served by /api/v1/deletions: dicts with id + deletedAt.
+        self.deleted = list(deleted or [])
+        # When True, every feedforge.org API request gets a Cloudflare managed challenge.
+        self.cf_block = cf_block
         self.calls: list[tuple[str, str]] = []
+        self.api_user_agents: list[str] = []
         self.cover_request_headers: dict | None = None
         # Run walks inline so tests never race a thread.
         self._start_catalog_walk = self._walk_catalog
@@ -178,11 +187,37 @@ class FakeFeedForgeAPI(FeedForgeProvider):
                  "content-disposition": 'attachment; filename="song.feedpak"'},
                 url,
             )
+        self.api_user_agents.append(str(req.get_header("User-agent") or ""))
+        if self.cf_block:
+            raise _http_error(url, 403, b"<html>Just a moment...</html>",
+                              {"Cf-Mitigated": "challenge", "Content-Type": "text/html"})
         if req.get_header("Authorization") != f"Bearer {self._valid_key}":
             raise _http_error(url, 401, json.dumps({"ok": False, "error": "Invalid key."}).encode())
         if self._rate_limit_times > 0:
             self._rate_limit_times -= 1
             raise _http_error(url, 429, b'{"ok":false,"error":"slow down"}', {"Retry-After": "0"})
+        if path == "/api/v1/me" and method == "GET":
+            body = {
+                "ok": True,
+                "data": {
+                    "user": {"id": "cfakeuser0000", "username": self.me_username,
+                             "displayName": self.me_username, "role": "USER"},
+                    "token": {"scopes": ["catalog:read", "feedpaks:download"],
+                              "expiresAt": self.me_expires_at,
+                              "lastUsedAt": "2026-07-18T00:00:00.000Z"},
+                },
+            }
+            return _Resp(json.dumps(body).encode(), {"Content-Type": "application/json"}, url)
+        if path == "/api/v1/deletions" and method == "GET":
+            qs = parse.parse_qs(parse.urlparse(url).query)
+            after = (qs.get("deletedAfter") or [""])[0]
+            rows = [t for t in self.deleted if str(t.get("deletedAt") or "") > after]
+            body = {
+                "ok": True,
+                "data": rows,
+                "pagination": {"limit": 50, "nextCursor": None, "hasMore": False},
+            }
+            return _Resp(json.dumps(body).encode(), {"Content-Type": "application/json"}, url)
         if path == "/api/v1/songs" and method == "GET":
             return self._songs_response(url, req)
         if path.startswith("/api/v1/songs/") and path.endswith("/download") and method == "POST":
@@ -556,6 +591,78 @@ def test_walk_resumes_from_cursor_after_transient_failures(tmp_path):
     assert len(first_page_walks) == 1  # page 1 was never re-fetched
 
 
+# ------------------------------------------------- honest UA + /me + deletions (v0.7.1)
+
+
+def test_api_requests_use_the_honest_user_agent(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=_songs(3))
+    provider.describe_source()
+
+    assert provider.api_user_agents  # /me probe + walk pages
+    assert all(ua.startswith("feedback-remote-library-client/") for ua in provider.api_user_agents)
+    assert not any("Mozilla" in ua for ua in provider.api_user_agents)  # the masquerade is gone
+
+
+def test_cloudflare_challenge_fails_with_a_clear_message(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=_songs(3), cf_block=True)
+    with pytest.raises(RuntimeError, match="report it to the FeedForge dev"):
+        provider.describe_source()
+
+
+def test_me_identity_flows_into_describe(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=_songs(3), me_username="melody")
+
+    info = provider.describe_source()
+
+    assert info["accountUsername"] == "melody"
+    assert info["sourceName"] == "FeedForge (melody)"
+    assert info["keyExpiryWarning"] == ""  # far-future key: no warning
+
+
+def test_key_expiry_warning_when_within_thirty_days(tmp_path):
+    from datetime import datetime, timedelta, timezone
+
+    soon = (datetime.now(timezone.utc) + timedelta(days=10)).isoformat().replace("+00:00", "Z")
+    provider = FakeFeedForgeAPI(tmp_path, catalog=_songs(2), me_expires_at=soon)
+
+    info = provider.describe_source()
+
+    assert "expires in 9 day" in info["keyExpiryWarning"] or "expires in 10 day" in info["keyExpiryWarning"]
+    assert "Connected apps" in info["keyExpiryWarning"]
+
+
+def test_deletions_feed_drops_records_on_refresh(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=_songs(5))
+    provider.describe_source()
+    assert provider.query_stats()["total_songs"] == 5
+
+    goner = provider.api_catalog.pop(0)
+    provider.deleted.append({"id": goner["id"], "deletedAt": "2036-01-01T00:00:00.000Z"})
+    with provider._mirror_lock:
+        provider._synced_at = -10_000  # force the TTL check to see a stale mirror
+
+    _songs_page, total = provider.query_page(size=10)
+
+    assert total == 4
+    assert provider._record(goner["id"]) is None
+    deletion_calls = [u for _m, u in provider.calls if "deletedAfter=" in u]
+    assert deletion_calls  # the tombstone feed was actually consulted
+
+
+def test_deletions_watermark_persists_and_reloads(tmp_path):
+    first = FakeFeedForgeAPI(tmp_path, catalog=_songs(3))
+    first.describe_source()
+    raw = json.loads((first.cache_dir / "catalog.json").read_text(encoding="utf-8"))
+    assert raw["deletionsWatermark"]  # set at walk completion, persisted
+
+    second = FakeFeedForgeAPI(tmp_path, catalog=_songs(3))
+    second.query_page(size=5)  # loads the mirror, delta+deletions refresh
+
+    assert second._deletions_watermark
+    deletion_calls = [u for _m, u in second.calls if "deletedAfter=" in u]
+    assert len(deletion_calls) == 1  # the reload refresh polled the feed once
+
+
 # --------------------------------------------------------------------------- artwork
 
 
@@ -719,7 +826,8 @@ def test_active_downloads_reports_downloading_then_ready(tmp_path):
 # ------------------------------------------------------------------------- route wiring
 
 
-def _stub_api(monkeypatch, *, catalog=None, raise_auth=False):
+def _stub_api(monkeypatch, *, catalog=None, raise_auth=False, me_username="stubuser",
+              me_expires_at="2036-01-01T00:00:00.000Z"):
     catalog = catalog if catalog is not None else _songs(7)
     api_calls: list[dict] = []
 
@@ -727,6 +835,16 @@ def _stub_api(monkeypatch, *, catalog=None, raise_auth=False):
         api_calls.append(dict(params or {}))
         if raise_auth:
             raise AuthRequiredError(KEY_REJECTED_MESSAGE)
+        if path.endswith("/me"):
+            return {
+                "ok": True,
+                "data": {"user": {"username": me_username, "displayName": me_username},
+                         "token": {"scopes": [], "expiresAt": me_expires_at,
+                                   "lastUsedAt": "2026-07-18T00:00:00.000Z"}},
+            }, 'W/"me"'
+        if path.endswith("/deletions"):
+            return {"ok": True, "data": [],
+                    "pagination": {"limit": 50, "nextCursor": None, "hasMore": False}}, 'W/"del"'
         params = params or {}
         rows = sorted(catalog, key=lambda r: r["createdAt"], reverse=True)
         if params.get("updatedAfter"):
@@ -829,6 +947,45 @@ def test_status_reports_syncing_while_walk_incomplete(tmp_path, monkeypatch):
     assert card["online"] is True
 
 
+def test_default_labels_track_the_account_identity(tmp_path, monkeypatch):
+    """A default label upgrades to "FeedForge (username)" once /me exposes the identity; a
+    label the user typed is never touched."""
+    _stub_api(monkeypatch)
+    routes, client = _setup_routes(tmp_path, registered={})
+    routes._store.upsert_source({
+        "type": "feedforge.v1", "providerId": "feedforge:one:aaa", "baseUrl": "https://feedforge.org",
+        "token": FAKE_KEY, "accountSeed": "aaaa1111", "label": "FeedForge", "enabled": True,
+    })
+    routes._store.upsert_source({
+        "type": "feedforge.v1", "providerId": "feedforge:two:bbb", "baseUrl": "https://feedforge.org",
+        "token": FAKE_KEY, "accountSeed": "bbbb2222", "label": "My Custom Name", "enabled": True,
+    })
+
+    status = client.get("/api/plugins/remote_library_client/status").json()["sources"]
+
+    by_id = {item.get("providerId"): item for item in status}
+    assert by_id["feedforge:one:aaa"]["label"] == "FeedForge (stubuser)"  # default upgraded
+    assert by_id["feedforge:one:aaa"]["username"] == "stubuser"
+    assert by_id["feedforge:two:bbb"]["label"] == "My Custom Name"  # custom preserved
+
+
+def test_status_shows_key_expiry_warning_after_sync(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    soon = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat().replace("+00:00", "Z")
+    _stub_api(monkeypatch, me_expires_at=soon)
+    _routes, client = _setup_routes(tmp_path, registered={})
+
+    client.post("/api/plugins/remote_library_client/sources", json={
+        "type": "feedforge.v1", "token": FAKE_KEY,
+    })
+    status = client.get("/api/plugins/remote_library_client/status").json()["sources"]
+
+    card = next(item for item in status if item.get("type") == "feedforge.v1")
+    assert "expires" in card["message"]  # walk complete, so the expiry warning gets the slot
+    assert card["online"] is True
+
+
 def test_add_feedforge_without_key_is_401_with_guidance(tmp_path, monkeypatch):
     _stub_api(monkeypatch)
     _routes, client = _setup_routes(tmp_path)
@@ -886,4 +1043,7 @@ def test_legacy_credentials_source_migrates_to_a_key(tmp_path, monkeypatch):
     stored = next(item for item in routes._store.list_sources()
                   if item.get("providerId") == "feedforge:legacy:abc123")
     assert "password" not in stored  # the obsolete secret is dropped at migration
-    assert stored["username"] == "tester"  # kept for the label; not a secret
+    # The key's account (from /me) is authoritative over the legacy stored username — the
+    # pasted key may even belong to a different account than the old login did.
+    assert stored["username"] == "stubuser"
+    assert stored["label"] == "My FeedForge"  # the user-typed label is never touched

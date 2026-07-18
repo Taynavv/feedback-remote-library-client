@@ -450,11 +450,22 @@ def _feedforge_source(seed: dict, provider: BaseLibraryProvider | None = None) -
     source.pop("password", None)  # the credentials era is over; never keep an unused secret
     provider = provider or _provider_for_source(source)
     info = provider.describe_source()
+    account_username = str(info.get("accountUsername") or "").strip()
     label = str(seed.get("label") or "").strip()
+    # Default labels track the account identity now that /me exposes it; a label the user
+    # typed themselves is never touched. "Default" = empty, the bare type name, or a
+    # previously-derived identity default (stored username covers a later account rename).
+    default_labels = {"", "FeedForge"}
+    for known in (account_username, str(seed.get("username") or "").strip()):
+        if known:
+            default_labels.add(f"FeedForge ({known})")
+    if label in default_labels:
+        label = ""
     source.update({
         "sourceId": info["sourceId"],
         "sourceName": info["sourceName"],
-        "label": label or seed.get("label") or info["sourceName"],
+        "label": label or info["sourceName"],
+        "username": account_username or str(seed.get("username") or "").strip(),
         "protocol": FeedForgeProvider.type,
         "songCount": _safe_int(info.get("songCount"), 0),
         "remoteCapabilities": list(info.get("capabilities") or []),
@@ -473,14 +484,15 @@ def _save_checked_feedforge_source(source: dict) -> dict:
     if not existing:
         provider = _register_provider_instance(provider, updated)
     _store.upsert_source(updated)
-    # While the initial walk is still filling the mirror, say so on the card — the count is an
-    # at-least value that grows on each refresh until the walk completes.
+    # One message slot on the card, most-urgent first: the initial walk still filling the
+    # mirror (counts are at-least values), else an approaching key expiry from /me.
     syncing = bool(provider and getattr(provider, "catalog_syncing", False))
+    expiry_warning = str(getattr(provider, "key_expiry_message", "") or "") if provider else ""
     return {
         **updated,
         "registered": bool(provider and provider.id in _providers),
         "online": True,
-        "message": CATALOG_SYNCING_MESSAGE if syncing else "",
+        "message": CATALOG_SYNCING_MESSAGE if syncing else expiry_warning,
     }
 
 
