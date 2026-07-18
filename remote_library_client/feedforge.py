@@ -12,17 +12,20 @@ API** (see ``FeedForge-Plugin-API-Guide.md``; live-verified 2026-07-16):
    prohibits collecting credentials, and keys also work for Discord-login accounts;
 2. the catalog is held as a **local mirror**: one paced, cursor-paginated walk of
    ``GET /api/v1/songs`` (the guide's recommended sync model), then incremental
-   ``updatedAfter`` deltas with ``ETag``/304 revalidation. Browsing, search, sorting, the A-Z
-   letter rail, artist browsing, and totals are all served locally from the mirror — including
-   the descending and year sorts the server itself does not offer;
+   ``updatedAfter`` deltas — and removals from the ``GET /api/v1/deletions`` tombstone feed —
+   with ``ETag``/304 revalidation. Browsing, search, sorting, the A-Z letter rail, artist
+   browsing, and totals are all served locally from the mirror — including the descending and
+   year sorts the server itself does not offer;
 3. downloads stay resolve-then-fetch: ``POST /api/v1/songs/{id}/download`` -> ``{ok, url}``
    (an external link — Google Drive, Dropbox, or a Proton Drive share in the wild), streamed
-   into the local cache by the matching host path.
+   into the local cache by the matching host path;
+4. ``GET /api/v1/me`` validates the key on first contact and supplies the account identity
+   (default source labels) and the key's expiry (a card warning 30 days ahead).
 
 Rate limits are documented (catalog: 60/min, 2000/day; downloads: 20/min, 500/day), so the
 walk is paced ~1 page/1.2s and refreshes are incremental; a 429 honors ``Retry-After`` once.
-Deletions never appear in ``updatedAfter`` deltas, so a periodic full re-walk reconciles
-ghosts (and a 404 on download drops the record immediately).
+The monthly full re-walk backstops the deletions feed (which only covers removals recorded
+after it deployed); a 404 on download still drops the record immediately.
 
 Stdlib-only, like the Google Drive type — the Proton-hosted download path reuses
 :mod:`remote_library_client.proton_drive`, whose native deps (``bcrypt`` + ``pysequoia``)
@@ -52,6 +55,7 @@ from remote_library_client.provider import (
     BaseLibraryProvider,
     LibraryImporter,
     _public_error_message,
+    _read_error_detail,
     _read_limited,
     _remote_error,
     _safe_int,
@@ -63,15 +67,30 @@ from remote_library_client.provider import (
 FEEDFORGE_DEFAULT_BASE_URL = "https://feedforge.org"
 FEEDFORGE_HOST = "feedforge.org"
 PACKAGE_SUFFIXES = (".feedpak", ".sloppak", ".psarc", ".zip")
-# A real browser User-Agent: feedforge.org sits behind Cloudflare, whose managed challenge
-# blocks unfamiliar clients even on the key-authed API (verified live: curl is challenged,
-# urllib with this UA passes). Raised with the FeedForge dev; until /api/v1 is exempted,
-# this header is load-bearing.
+
+
+def _plugin_version() -> str:
+    """The plugin's own version (from plugin.json, two levels up), for the User-Agent."""
+    try:
+        manifest = json.loads(
+            (Path(__file__).resolve().parent.parent / "plugin.json").read_text(encoding="utf-8")
+        )
+        return str(manifest.get("version") or "0")
+    except (OSError, ValueError):
+        return "0"
+
+
+# An HONEST User-Agent, at the FeedForge dev's request (2026-07-18): Cloudflare now exempts
+# registered API clients, so the browser masquerade the scrape era needed is gone —
+# deliberately. If the firewall ever challenges this UA again we fail loudly with
+# CLOUDFLARE_BLOCKED_MESSAGE (the dev asked to be told) rather than faking a browser.
 _USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    f"feedback-remote-library-client/{_plugin_version()} "
+    "(+https://github.com/Taynavv/feedback-remote-library-client)"
 )
 _API_SONGS_PATH = "/api/v1/songs"
+_API_ME_PATH = "/api/v1/me"
+_API_DELETIONS_PATH = "/api/v1/deletions"
 # The server caps `limit` at 50 (verified); a module-level constant so tests can shrink it.
 _API_PAGE_LIMIT = 50
 # ~50 pages/min keeps the walk safely under the documented 60/min catalog limit.
@@ -96,6 +115,12 @@ RATE_LIMITED_MESSAGE = "FeedForge is rate-limiting this key; try again in a minu
 CATALOG_SYNCING_MESSAGE = (
     "Syncing the FeedForge catalog — songs appear as they arrive; refresh to update the count."
 )
+CLOUDFLARE_BLOCKED_MESSAGE = (
+    "FeedForge's firewall blocked this API client (a Cloudflare challenge). That should not "
+    "happen with the plugin's registered User-Agent — please report it to the FeedForge dev."
+)
+# The /me endpoint reports the key's expiry; the card starts warning this many days ahead.
+KEY_EXPIRY_WARNING_DAYS = 30
 
 
 class SongGoneError(RuntimeError):
@@ -244,9 +269,10 @@ class FeedForgeProvider(BaseLibraryProvider):
     walk_pace_seconds = _WALK_PACE_SECONDS
     # After a failed walk, wait this long before another attempt (no hot retry loops).
     walk_retry_seconds = 60.0
-    # `updatedAfter` cannot report deletions, so a completed walk this old is re-run in the
-    # background to reconcile ghosts (a 404 on download also drops a record immediately).
-    full_resync_seconds = 7 * 86400
+    # Routine ghost cleanup now rides the /api/v1/deletions feed (every delta refresh); this
+    # monthly full re-walk is the belt-and-braces backstop for missed tombstones and the
+    # pre-feature deletion gap (the feed only covers removals recorded after it deployed).
+    full_resync_seconds = 30 * 86400
     # Honor a 429's Retry-After (retry once, per the API guide) only up to this long; a longer
     # server-requested wait surfaces as an error instead of stalling a request thread.
     max_retry_after_seconds = 30.0
@@ -274,10 +300,10 @@ class FeedForgeProvider(BaseLibraryProvider):
         # label, and its presence without a key selects the "migrate to access keys" message.
         self.username = str(source.get("username") or "").strip()
         self._legacy_credentials = bool(source.get("password")) or bool(self.username and not self.token)
-        # The API has no whoami endpoint, so an account has no derivable identity (raised with
-        # the FeedForge dev). A per-source random seed (minted at add time) keeps providerId —
-        # and the local import folder — stable across key rotations and distinct across
-        # accounts; legacy sources keep their username-derived identity.
+        # providerId stays anchored to a per-source random seed (minted at add time), NOT the
+        # /me account identity: the seed keeps providerId — and the local import folder —
+        # stable across key rotations, and distinct across accounts. /me's username is
+        # display-only (labels); legacy sources keep their username-derived identity.
         ident = str(source.get("accountSeed") or "").strip() or self.username
         self._account_key = sanitize_filename(f"{host}_{ident}" if ident else host, "feedforge")
         provider_id = str(
@@ -309,7 +335,14 @@ class FeedForgeProvider(BaseLibraryProvider):
         self._synced_at = float("-inf")
         self._watermark = ""  # updatedAfter cursor (the last walk/delta start time, ISO)
         self._delta_etag = ""  # ETag of the last unchanged-watermark delta request
+        self._deletions_watermark = ""  # deletedAfter cursor for the tombstone feed
+        self._deletions_etag = ""
         self._full_walk_wall = 0.0  # wall-clock time of the last *completed* full walk
+        # Account status from /api/v1/me: identity for labels, key expiry for the card
+        # warning. Seeded from the stored username (legacy sources) until the first fetch.
+        self._account_username = self.username
+        self._key_expires_ts = 0.0
+        self._me_fetched_at = float("-inf")
         self._walk_thread: threading.Thread | None = None
         self._first_page_event = threading.Event()
         self._walk_error = ""
@@ -355,12 +388,24 @@ class FeedForgeProvider(BaseLibraryProvider):
             return None
 
     def _api_error(self, exc: error.HTTPError) -> Exception:
+        headers = getattr(exc, "headers", None)
+        if exc.code == 403 and headers and headers.get("Cf-Mitigated"):
+            # The request never reached FeedForge — Cloudflare challenged the client. With
+            # the registered honest UA this is a firewall regression to report, not something
+            # to mask by faking a browser again.
+            return RuntimeError(CLOUDFLARE_BLOCKED_MESSAGE)
         if exc.code == 401:
             return AuthRequiredError(KEY_REJECTED_MESSAGE)
         if exc.code == 404:
             return SongGoneError("this song is no longer available on FeedForge")
         if exc.code == 429:
-            return RuntimeError(RATE_LIMITED_MESSAGE)
+            # 429 bodies now say which limit was hit (user vs IP) — pass that through.
+            detail = ""
+            try:
+                detail = str(json.loads(_read_error_detail(exc)).get("error") or "")
+            except (ValueError, TypeError):
+                pass
+            return RuntimeError(f"{RATE_LIMITED_MESSAGE} ({detail})" if detail else RATE_LIMITED_MESSAGE)
         return _remote_error(exc)
 
     def _open_api(self, req: request.Request, timeout: float, *, sent_etag: str = "",
@@ -440,6 +485,10 @@ class FeedForgeProvider(BaseLibraryProvider):
         self._records = records
         self._watermark = str(raw.get("watermark") or "")
         self._delta_etag = str(raw.get("etag") or "")
+        # Pre-deletions-feed mirrors have no deletion watermark: fall back to the update
+        # watermark (both mark "state is authoritative up to here").
+        self._deletions_watermark = str(raw.get("deletionsWatermark") or raw.get("watermark") or "")
+        self._deletions_etag = ""
         self._full_walk_wall = float(raw.get("fullWalkAt") or 0.0)
         self._mirror_complete = True
         # Deliberately stale (-inf, NOT 0.0 — see __init__) so the first use delta-refreshes,
@@ -451,6 +500,7 @@ class FeedForgeProvider(BaseLibraryProvider):
             "schema": _MIRROR_SCHEMA,
             "watermark": self._watermark,
             "etag": self._delta_etag,
+            "deletionsWatermark": self._deletions_watermark,
             "fullWalkAt": self._full_walk_wall,
             "records": list(self._records.values()),
         }
@@ -544,6 +594,10 @@ class FeedForgeProvider(BaseLibraryProvider):
                     self._records.pop(stale_id, None)
             self._watermark = started_iso
             self._delta_etag = ""
+            # A completed walk IS the deletion reconciliation up to its start time; the
+            # tombstone feed takes over from here.
+            self._deletions_watermark = started_iso
+            self._deletions_etag = ""
             self._mirror_complete = True
             self._synced_at = time.monotonic()
             self._full_walk_wall = time.time()
@@ -604,6 +658,57 @@ class FeedForgeProvider(BaseLibraryProvider):
             else:
                 self._delta_etag = first_etag
 
+    def _refresh_deletions(self) -> None:
+        """Drop mirror records tombstoned since the deletion watermark
+        (``GET /api/v1/deletions?deletedAfter=…``, cursor-paginated + ETag like the catalog).
+        The feed only covers removals recorded after it deployed, so the monthly full re-walk
+        stays as the backstop. Tombstone items are parsed defensively (the live feed was empty
+        when verified): a dict's ``id``/``songId``, or a bare id string."""
+        with self._mirror_lock:
+            watermark = self._deletions_watermark
+            etag = self._deletions_etag
+        if not watermark:
+            return  # no completed walk yet — nothing authoritative to reconcile against
+        started_iso = _utc_iso_now()
+        cursor = ""
+        dropped = 0
+        first_etag = ""
+        while True:
+            params: dict = {"limit": _API_PAGE_LIMIT, "deletedAfter": watermark}
+            if cursor:
+                params["cursor"] = cursor
+            try:
+                payload, response_etag = self._api_get(
+                    _API_DELETIONS_PATH, params, etag=etag if not cursor else ""
+                )
+            except SongGoneError:
+                return  # a 404 here means the feed itself is gone — the re-walk still covers us
+            if payload is None:  # 304 — no new tombstones since the last look
+                return
+            if not cursor:
+                first_etag = response_etag
+            with self._mirror_lock:
+                for item in payload.get("data") or []:
+                    if isinstance(item, dict):
+                        song_id = str(item.get("id") or item.get("songId") or "")
+                    else:
+                        song_id = str(item or "")
+                    if song_id and self._records.pop(song_id, None) is not None:
+                        dropped += 1
+            pagination = payload.get("pagination") or {}
+            cursor = str(pagination.get("nextCursor") or "")
+            if not pagination.get("hasMore") or not cursor:
+                break
+            if self.walk_pace_seconds:
+                time.sleep(self.walk_pace_seconds)
+        with self._mirror_lock:
+            if dropped:
+                self._deletions_watermark = started_iso
+                self._deletions_etag = ""
+                self._persist_mirror_locked()
+            else:
+                self._deletions_etag = first_etag
+
     def _refresh_if_stale(self) -> None:
         if self._walk_alive():
             return  # a walk is already syncing; don't stack a delta on top
@@ -612,6 +717,7 @@ class FeedForgeProvider(BaseLibraryProvider):
                 stale = time.monotonic() - self._synced_at > self.metadata_cache_ttl_seconds
             if stale:
                 self._refresh_delta()
+                self._refresh_deletions()
         with self._mirror_lock:
             wants_rewalk = (
                 self._full_walk_wall
@@ -802,23 +908,68 @@ class FeedForgeProvider(BaseLibraryProvider):
         shows a "syncing" message and counts are at-least values."""
         return not self._mirror_complete
 
+    @property
+    def account_username(self) -> str:
+        return self._account_username
+
+    @property
+    def key_expiry_message(self) -> str:
+        """A card warning once the key is within ``KEY_EXPIRY_WARNING_DAYS`` of expiring.
+        An already-dead key is not a countdown — it surfaces through the 401 path instead."""
+        if not self._key_expires_ts:
+            return ""
+        days = (self._key_expires_ts - time.time()) / 86400
+        if days <= 0 or days > KEY_EXPIRY_WARNING_DAYS:
+            return ""
+        when = "today" if days < 1 else f"in {int(days)} day{'s' if int(days) != 1 else ''}"
+        return (
+            f"FeedForge access key expires {when} — create a new key under Profile → "
+            "Connected apps and paste it here."
+        )
+
+    def _fetch_account_status(self) -> None:
+        """``GET /api/v1/me`` — validates the key and captures the account identity (for
+        default labels) plus the key's expiry (for the card warning). Shape (verified live):
+        ``data.user.{username, displayName}`` and ``data.token.{scopes, expiresAt, lastUsedAt}``."""
+        payload, _etag = self._api_get(_API_ME_PATH, timeout=15)
+        data = (payload or {}).get("data") or {}
+        user = data.get("user") or {}
+        token = data.get("token") or {}
+        with self._mirror_lock:
+            fetched = str(user.get("username") or user.get("displayName") or "").strip()
+            if fetched:
+                self._account_username = fetched
+            self._key_expires_ts = _parse_ts(token.get("expiresAt"))
+            self._me_fetched_at = time.monotonic()
+
     def describe_source(self) -> dict:
         with self._mirror_lock:
             self._load_mirror_from_disk_locked()
             have_records = bool(self._records)
+            me_stale = time.monotonic() - self._me_fetched_at > self.metadata_cache_ttl_seconds
         if not have_records:
-            # First contact for this source: one cheap authed call so a bad/expired key fails
-            # the add (or the first status poll) immediately, not minutes into a walk.
-            self._api_get(_API_SONGS_PATH, {"limit": 1}, timeout=15)
+            # First contact for this source: /me validates the key fast (a bad/expired key
+            # fails the add immediately, not minutes into a walk) and yields the identity.
+            self._fetch_account_status()
+        elif me_stale:
+            try:
+                self._fetch_account_status()
+            except AuthRequiredError:
+                raise  # a revoked/expired key must flip the card to Key required
+            except Exception:  # noqa: BLE001 — identity/expiry refresh is best-effort on polls
+                pass
         self._ensure_catalog(wait_seconds=self.describe_wait_seconds)
         with self._mirror_lock:
             count = len(self._records)
+            username = self._account_username
         return {
             "ok": True,
             "sourceId": f"feedforge_{self._account_key}",
-            "sourceName": self.label,
+            "sourceName": f"FeedForge ({username})" if username else self.label,
+            "accountUsername": username,
             "songCount": count,
             "syncing": self.catalog_syncing,
+            "keyExpiryWarning": self.key_expiry_message,
             "capabilities": ["library.read", "song.sync"],
             "server": {"protocol": self.type},
         }
