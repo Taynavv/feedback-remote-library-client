@@ -117,6 +117,7 @@ Notes and limits:
 - The client stays inside FeedForge's documented API **rate limits**: the initial sync paces itself, and day-to-day browsing is local (near-zero API traffic).
 - A song whose uploader hosts the file on **Proton Drive** needs the Proton native dependencies (`bcrypt` + `pysequoia`, from [requirements.txt](requirements.txt)) at download time; everything else about the source works without them.
 - Favorites, collections, ratings, and uploads aren't part of FeedForge's plugin API — use the website for those.
+- Some songs have **multiple FeedForge listings** (the same song from different charters, or several versions); each listing downloads and plays independently. **Upgrading from 0.7.1 or earlier:** previously-downloaded FeedForge songs show as not-downloaded once — local filenames changed to tell versions apart. Your files remain playable in the local library; clicking a song again simply fetches it fresh under the new name.
 - No extra dependency — like the Google Drive type, it runs on the standard stdlib HTTP stack.
 
 ## Flow

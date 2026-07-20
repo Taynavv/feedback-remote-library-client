@@ -52,3 +52,8 @@ Hardening already in place:
   internal / loopback / link-local host (an SSRF guard). This can be disabled per source
   with the **Allow unsafe redirects** toggle when a trusted server legitimately relies on
   such redirects.
+- A MediaFire-hosted download scrapes the share page for its direct-download URL; a
+  scraped URL is followed **only if it stays on a mediafire.com host**. A FeedForge
+  download link on a host the plugin has no handler for is refused with a clear error
+  (never blind-fetched), and the Dropbox / direct-link path refuses an HTML response
+  rather than caching a web page as a package.
