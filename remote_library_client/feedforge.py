@@ -808,14 +808,25 @@ class FeedForgeProvider(BaseLibraryProvider):
     # -- normalization + querying ---------------------------------------
 
     def _remote_filename(self, record: dict) -> str:
-        """Deterministic local filename for a record: ``Artist - Title.feedpak``.
+        """Deterministic local filename for a record: ``Artist - Title.<songId>.feedpak``.
 
         We import under this name (not the CDN's Content-Disposition) so the browse-time
         ``settingsKey`` — derived from the same name — matches core's key for the imported
-        file (the client<->core playback-settings-key contract)."""
+        file (the client<->core playback-settings-key contract). The song id keeps the
+        name unique PER LISTING: FeedForge carries multiple uploads of some songs
+        (distinct records, same artist+title), and a shared name made a second version
+        resolve to the first version's file instead of downloading — or, synced
+        concurrently, collide into ``-2`` suffixed imports whose settingsKey no longer
+        matched. The id rides between dots (``[]``/``()`` would be mangled by
+        ``sanitize_filename``); ``playback_settings_key`` hashes the whole name, so keys
+        stay per-listing too. Pre-v0.7.2 downloads (no id in the name) are deliberately
+        no longer recognized — an accepted break; they remain playable entries in the
+        local library."""
         artist = record.get("artist") or "Unknown artist"
         title = record.get("title") or record.get("id") or "song"
-        return sanitize_filename(f"{artist} - {title}.feedpak", "remote-song.feedpak")
+        song_id = str(record.get("id") or "").strip()
+        marker = f".{song_id}" if song_id else ""
+        return sanitize_filename(f"{artist} - {title}{marker}.feedpak", "remote-song.feedpak")
 
     def _downloaded_names(self) -> frozenset[str]:
         if not self.local_library_root or not self.local_library_root.exists():

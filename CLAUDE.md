@@ -271,9 +271,17 @@ anonymous end-to-end-encrypted Proton Drive public share of package files.
   "please report it" message naming the host) — both guards kill the silent HTML-cached-as-feedpak
   failure class MediaFire used to be, so a future FeedForge host addition surfaces as a clear error,
   never a corrupt import. It
-  **imports under the deterministic `Artist - Title.feedpak` name** (not the CDN's Content-Disposition)
-  so the browse-time `settingsKey` matches core's key for the imported file (the client↔core
-  playback-settings-key contract). Cover art (`coverUrl`) is public — fetched **without** the key.
+  **imports under the deterministic `Artist - Title.<songId>.feedpak` name** (not the CDN's
+  Content-Disposition) so the browse-time `settingsKey` matches core's key for the imported file (the
+  client↔core playback-settings-key contract). The embedded song id keeps the name unique **per
+  listing** — FeedForge carries multiple uploads of some songs (same artist+title, distinct records),
+  and a shared `Artist - Title` name made a second version resolve to the first version's file instead
+  of downloading, or collide concurrent syncs into `-2` imports whose settingsKey no longer matched.
+  The id rides between dots (brackets would be mangled by `sanitize_filename`), and
+  `playback_settings_key` hashes the whole filename so keys stay per-listing. Pre-v0.7.2 downloads
+  (no id in the name) are deliberately unrecognized — an accepted break, do NOT add a legacy-name
+  fallback (an id-less file is unattributable once a second listing exists); they stay playable in
+  the local library. Cover art (`coverUrl`) is public — fetched **without** the key.
 
 ## Rules
 
