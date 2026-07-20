@@ -18,7 +18,9 @@ API** (see ``FeedForge-Plugin-API-Guide.md``; live-verified 2026-07-16):
    year sorts the server itself does not offer;
 3. downloads stay resolve-then-fetch: ``POST /api/v1/songs/{id}/download`` -> ``{ok, url}``
    (an external link — Google Drive, Dropbox, MediaFire, or a Proton Drive share in the
-   wild), streamed into the local cache by the matching host path;
+   wild), streamed into the local cache by the matching host path; a link on a host with
+   no handler (and no plainly-direct package suffix) fails loudly instead of caching a
+   download *page* as a package;
 4. ``GET /api/v1/me`` validates the key on first contact and supplies the account identity
    (default source labels) and the key's expiry (a card warning 30 days ahead).
 
@@ -183,6 +185,38 @@ def _direct_download_url(url: str) -> str:
         query.append(("dl", "1"))
         return parse.urlunparse(parsed._replace(query=parse.urlencode(query)))
     return url
+
+
+_DROPBOX_HOST_SUFFIXES = ("dropbox.com", "dropboxusercontent.com")
+
+
+def _is_dropbox_url(url: str) -> bool:
+    host = (parse.urlparse(str(url or "")).hostname or "").lower()
+    return any(host == suffix or host.endswith("." + suffix) for suffix in _DROPBOX_HOST_SUFFIXES)
+
+
+def _has_package_suffix(url: str) -> bool:
+    """A URL whose path plainly names a package file — downloadable from any host as-is."""
+    return parse.unquote(parse.urlparse(str(url or "")).path).lower().endswith(PACKAGE_SUFFIXES)
+
+
+def _unsupported_link_error(url: str, *, served_page: bool = False) -> RuntimeError:
+    """A loud, user-facing error for a download link this plugin has no handler for.
+
+    ``served_page=True`` is the accepted-then-betrayed case: the host passed the URL
+    checks but answered with an HTML page (a download *page* needing a scraper we don't
+    have) — the silent-corruption class MediaFire used to be before it got a handler."""
+    host = (parse.urlparse(str(url or "")).hostname or "").lower() or "an unrecognized address"
+    if served_page:
+        return RuntimeError(
+            f"the download link on {host} served a web page instead of a package file; the "
+            "plugin may need new support for this host — please report it"
+        )
+    return RuntimeError(
+        f"FeedForge returned a download link on {host}, which this plugin does not support "
+        "(supported: Google Drive, Dropbox, MediaFire, Proton Drive, or a direct package "
+        "link) — please report it so support can be added"
+    )
 
 
 def _filename_from_url(url: str, song_id: str) -> str:
@@ -1056,11 +1090,15 @@ class FeedForgeProvider(BaseLibraryProvider):
             target, content_hash, bytes_read, _headers = mediafire.download_mediafire_file(
                 self, url, remote_name, self._download_headers()
             )
-        else:
-            # Non-Drive host (e.g. Dropbox) — coerce to a direct-download URL, then stream.
-            target, content_hash, bytes_read, _headers = self._download_url_to_cache(
-                _direct_download_url(url), remote_name, self._download_headers()
+        elif _is_dropbox_url(url) or _has_package_suffix(url):
+            # Dropbox (coerced from its ?dl=0 HTML preview to ?dl=1) or a plainly-direct
+            # package URL on any host — streamed, but an HTML response is refused.
+            target, content_hash, bytes_read, _headers = self._download_direct_package(
+                url, remote_name
             )
+        else:
+            # No handler and nothing recognizably direct: fail loudly now, not at playback.
+            raise _unsupported_link_error(url)
         result = {
             "ok": True,
             "song_id": song_id,
@@ -1072,6 +1110,19 @@ class FeedForgeProvider(BaseLibraryProvider):
         # Import under the deterministic name (see _remote_filename) to keep settingsKey stable.
         result.update(self._import_into_library(target, content_hash, remote_name))
         return result
+
+    def _download_direct_package(self, url: str, filename: str) -> tuple[Path, str, int, dict]:
+        """Stream a Dropbox / plainly-direct package URL into the cache, refusing an HTML
+        response — a download *page* here means a host handler is missing, and caching it
+        as a package would fail silently at import/playback instead of loudly now."""
+        req = request.Request(_direct_download_url(url), headers=self._download_headers())
+        try:
+            with self._urlopen(req, timeout=120) as response:
+                if "text/html" in (response.headers.get("content-type") or "").lower():
+                    raise _unsupported_link_error(url, served_page=True)
+                return self._stream_response_to_cache(response, filename)
+        except error.HTTPError as exc:
+            raise _remote_error(exc) from exc
 
     def _download_label(self, song_id: str, record: dict | None = None) -> str:
         record = record or self._record(song_id)

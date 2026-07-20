@@ -188,6 +188,9 @@ class FakeFeedForgeAPI(FeedForgeProvider):
                 '   id="downloadButton" rel="nofollow">Download</a>'
             )
             return _Resp(page.encode(), {"content-type": "text/html; charset=UTF-8"}, url)
+        if host == "htmlpage.example.com":
+            # A host that serves a web page where a package was expected.
+            return _Resp(b"<html>a download page</html>", {"content-type": "text/html"}, url)
         if host != "feedforge.org":
             # External CDN (Google Drive / Dropbox / …): stream file bytes.
             return _Resp(
@@ -800,6 +803,45 @@ def test_do_sync_routes_mediafire_links_through_the_mediafire_module(tmp_path):
     urls = [u for _m, u in provider.calls]
     assert any(u.startswith("https://www.mediafire.com/file/") for u in urls)  # the share page
     assert any(u.startswith("https://download9.mediafire.com/") for u in urls)  # the scraped direct URL
+
+
+def test_do_sync_unsupported_host_fails_loudly_without_fetching(tmp_path):
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache", catalog=[_api_song(5)],
+        download_payload={"ok": True, "url": "https://mega.nz/file/abc123#key"},
+    )
+    provider.describe_source()
+
+    with pytest.raises(RuntimeError, match="mega.nz.*does not support"):
+        provider._do_sync(_api_song(5)["id"])
+
+    assert not any("mega.nz" in u for _m, u in provider.calls)  # refused before any fetch
+
+
+def test_do_sync_direct_package_link_on_unknown_host_still_streams(tmp_path):
+    # A URL whose path plainly names a package is downloadable from any host — the
+    # unsupported-host guard must not regress the catalog's direct-link tail.
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache", catalog=[_api_song(5)],
+        download_payload={"ok": True, "url": "https://files.example.com/paks/Fake%20Song.feedpak"},
+    )
+    provider.describe_source()
+
+    result = provider._do_sync(_api_song(5)["id"])
+
+    assert result["ok"] is True
+    assert result["bytes"] > 0
+
+
+def test_do_sync_html_where_package_expected_fails_loudly(tmp_path):
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache", catalog=[_api_song(5)],
+        download_payload={"ok": True, "url": "https://htmlpage.example.com/Fake.feedpak"},
+    )
+    provider.describe_source()
+
+    with pytest.raises(RuntimeError, match="web page instead of a package"):
+        provider._do_sync(_api_song(5)["id"])
 
 
 def test_do_sync_raises_when_no_download_url(tmp_path):

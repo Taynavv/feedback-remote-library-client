@@ -264,8 +264,13 @@ anonymous end-to-end-encrypted Proton Drive public share of package files.
   scraped for the per-request `download####.mediafire.com` URL; a scraped target must stay on a
   mediafire.com host (loud failure over fetching who-knows-what if the page layout changes), and a
   dead file (redirect to `error.php`, HTTP 404, "Invalid or Deleted File") surfaces the clear
-  `FILE_GONE_MESSAGE` instead of caching an HTML page as a package; **everything else (Dropbox)** →
-  `_download_url_to_cache` after `_direct_download_url` coerces `?dl=0` (HTML preview) to `?dl=1`. It
+  `FILE_GONE_MESSAGE` instead of caching an HTML page as a package; **Dropbox + plainly-direct
+  package links** (any host whose URL *path* ends in a package suffix) → `_download_direct_package`,
+  which coerces Dropbox's `?dl=0` (HTML preview) to `?dl=1` via `_direct_download_url` and *refuses*
+  an HTML response; **any other host fails loudly pre-fetch** (`_unsupported_link_error`, a
+  "please report it" message naming the host) — both guards kill the silent HTML-cached-as-feedpak
+  failure class MediaFire used to be, so a future FeedForge host addition surfaces as a clear error,
+  never a corrupt import. It
   **imports under the deterministic `Artist - Title.feedpak` name** (not the CDN's Content-Disposition)
   so the browse-time `settingsKey` matches core's key for the imported file (the client↔core
   playback-settings-key contract). Cover art (`coverUrl`) is public — fetched **without** the key.
