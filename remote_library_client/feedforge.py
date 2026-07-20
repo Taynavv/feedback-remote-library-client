@@ -17,8 +17,8 @@ API** (see ``FeedForge-Plugin-API-Guide.md``; live-verified 2026-07-16):
    browsing, and totals are all served locally from the mirror — including the descending and
    year sorts the server itself does not offer;
 3. downloads stay resolve-then-fetch: ``POST /api/v1/songs/{id}/download`` -> ``{ok, url}``
-   (an external link — Google Drive, Dropbox, or a Proton Drive share in the wild), streamed
-   into the local cache by the matching host path;
+   (an external link — Google Drive, Dropbox, MediaFire, or a Proton Drive share in the
+   wild), streamed into the local cache by the matching host path;
 4. ``GET /api/v1/me`` validates the key on first contact and supplies the account identity
    (default source labels) and the key's expiry (a card warning 30 days ahead).
 
@@ -44,7 +44,7 @@ from urllib import error, parse, request
 
 from fastapi.responses import Response
 
-from remote_library_client import proton_drive
+from remote_library_client import mediafire, proton_drive
 from remote_library_client.google_drive import (
     download_drive_file,
     drive_file_id_from_url,
@@ -174,8 +174,8 @@ def normalize_feedforge_base_url(url: str) -> str:
 def _direct_download_url(url: str) -> str:
     """Coerce a resolved share link to its direct-download form. FeedForge indexes external
     hosts; Dropbox share links serve an HTML *preview* at ``?dl=0`` and stream the file only at
-    ``?dl=1``, so force that. Google Drive and Proton Drive are handled separately; everything
-    else is returned unchanged."""
+    ``?dl=1``, so force that. Google Drive, Proton Drive, and MediaFire are handled separately;
+    everything else is returned unchanged."""
     parsed = parse.urlparse(str(url or ""))
     host = (parsed.hostname or "").lower()
     if host == "dropbox.com" or host.endswith(".dropbox.com"):
@@ -1050,6 +1050,12 @@ class FeedForgeProvider(BaseLibraryProvider):
                     "this song is hosted on Proton Drive; install the plugin requirements "
                     "(bcrypt + pysequoia) to download it"
                 ) from exc
+        elif mediafire.is_mediafire_url(url):
+            # MediaFire (a FeedForge upload host since 2026-07): the share link serves an
+            # HTML page, so scrape its download button for the real file URL.
+            target, content_hash, bytes_read, _headers = mediafire.download_mediafire_file(
+                self, url, remote_name, self._download_headers()
+            )
         else:
             # Non-Drive host (e.g. Dropbox) — coerce to a direct-download URL, then stream.
             target, content_hash, bytes_read, _headers = self._download_url_to_cache(

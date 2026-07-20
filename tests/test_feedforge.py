@@ -179,6 +179,15 @@ class FakeFeedForgeAPI(FeedForgeProvider):
             # Public cover art — record the headers so tests can assert the key never rides.
             self.cover_request_headers = dict(req.headers)
             return _Resp(b"\x89PNG fake image", {"Content-Type": "image/png"}, url)
+        if host == "www.mediafire.com":
+            # A MediaFire share link serves an HTML download *page* whose button points at
+            # the direct-download host; that host falls through to the CDN branch below.
+            page = (
+                '<a class="input popsok" aria-label="Download file"\n'
+                '   href="https://download9.mediafire.com/tok123/fakekey01234567/Song.feedpak"\n'
+                '   id="downloadButton" rel="nofollow">Download</a>'
+            )
+            return _Resp(page.encode(), {"content-type": "text/html; charset=UTF-8"}, url)
         if host != "feedforge.org":
             # External CDN (Google Drive / Dropbox / …): stream file bytes.
             return _Resp(
@@ -767,6 +776,30 @@ def test_do_sync_proton_without_native_deps_degrades_clearly(tmp_path, monkeypat
 
     with pytest.raises(RuntimeError, match="bcrypt \\+ pysequoia"):
         provider._do_sync(_api_song(5)["id"])
+
+
+def test_do_sync_routes_mediafire_links_through_the_mediafire_module(tmp_path):
+    local_root = tmp_path / "dlc"
+    local_root.mkdir()
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache",
+        catalog=[_api_song(5, artist="Zeta Testers", title="Song Bravo")],
+        download_payload={"ok": True,
+                          "url": "https://www.mediafire.com/file/fakekey01234567/Song.feedpak/file"},
+        local_library_root=local_root,
+        library_importer=lambda path, root: {"libraryImportState": "indexed",
+                                             "libraryFilename": path.relative_to(root).as_posix()},
+    )
+    provider.describe_source()
+
+    result = provider._do_sync(_api_song(5)["id"])
+
+    assert result["ok"] is True
+    # Imported under the deterministic mirror-record name, not the CDN's filename.
+    assert result["localFilename"].endswith("Zeta Testers - Song Bravo.feedpak")
+    urls = [u for _m, u in provider.calls]
+    assert any(u.startswith("https://www.mediafire.com/file/") for u in urls)  # the share page
+    assert any(u.startswith("https://download9.mediafire.com/") for u in urls)  # the scraped direct URL
 
 
 def test_do_sync_raises_when_no_download_url(tmp_path):
