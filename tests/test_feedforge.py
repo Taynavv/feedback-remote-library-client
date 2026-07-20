@@ -67,6 +67,11 @@ def _songs(n: int) -> list[dict]:
     return [_api_song(i) for i in range(n)]
 
 
+def _mirror_filename(i: int, artist: str, title: str) -> str:
+    """The provider's deterministic per-listing local name for ``_api_song(i)``."""
+    return f"{artist} - {title}.cfake{i:019d}.feedpak"
+
+
 class _Resp:
     """Minimal urllib response stand-in: context manager + read() + headers + geturl()."""
 
@@ -179,6 +184,18 @@ class FakeFeedForgeAPI(FeedForgeProvider):
             # Public cover art — record the headers so tests can assert the key never rides.
             self.cover_request_headers = dict(req.headers)
             return _Resp(b"\x89PNG fake image", {"Content-Type": "image/png"}, url)
+        if host == "www.mediafire.com":
+            # A MediaFire share link serves an HTML download *page* whose button points at
+            # the direct-download host; that host falls through to the CDN branch below.
+            page = (
+                '<a class="input popsok" aria-label="Download file"\n'
+                '   href="https://download9.mediafire.com/tok123/fakekey01234567/Song.feedpak"\n'
+                '   id="downloadButton" rel="nofollow">Download</a>'
+            )
+            return _Resp(page.encode(), {"content-type": "text/html; charset=UTF-8"}, url)
+        if host == "htmlpage.example.com":
+            # A host that serves a web page where a package was expected.
+            return _Resp(b"<html>a download page</html>", {"content-type": "text/html"}, url)
         if host != "feedforge.org":
             # External CDN (Google Drive / Dropbox / …): stream file bytes.
             return _Resp(
@@ -518,7 +535,7 @@ def test_query_page_marks_downloaded_song_as_local(tmp_path):
     provider = FakeFeedForgeAPI(tmp_path / "cache",
                                 catalog=[_api_song(5, artist="Zeta Testers", title="Song Bravo")],
                                 local_library_root=local_root)
-    name = "Zeta Testers - Song Bravo.feedpak"
+    name = "Zeta Testers - Song Bravo.cfake0000000000000000005.feedpak"
     target = local_root / provider._source_folder_name() / name
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(b"downloaded")
@@ -707,8 +724,8 @@ def test_do_sync_resolves_drive_link_and_imports(tmp_path):
     assert result["ok"] is True
     assert result["playbackSource"] == "library-folder"
     assert result["libraryImportState"] == "indexed"
-    # Imported under the mirror record's deterministic "Artist - Title.feedpak" name.
-    assert result["localFilename"].endswith("Zeta Testers - Song Bravo.feedpak")
+    # Imported under the mirror record's deterministic "Artist - Title.<songId>.feedpak" name.
+    assert result["localFilename"].endswith("Zeta Testers - Song Bravo.cfake0000000000000000005.feedpak")
     assert len(imported) == 1
     assert any(m == "POST" and "/download" in u for m, u in provider.calls)
 
@@ -750,7 +767,7 @@ def test_do_sync_routes_proton_links_through_the_proton_module(tmp_path, monkeyp
 
     assert result["ok"] is True
     assert seen["url"] == "https://drive.proton.me/urls/FAKETOKEN0#pw"
-    assert seen["filename"] == "Zeta Testers - Song Bravo.feedpak"
+    assert seen["filename"] == "Zeta Testers - Song Bravo.cfake0000000000000000005.feedpak"
 
 
 def test_do_sync_proton_without_native_deps_degrades_clearly(tmp_path, monkeypatch):
@@ -769,11 +786,133 @@ def test_do_sync_proton_without_native_deps_degrades_clearly(tmp_path, monkeypat
         provider._do_sync(_api_song(5)["id"])
 
 
+def test_do_sync_routes_mediafire_links_through_the_mediafire_module(tmp_path):
+    local_root = tmp_path / "dlc"
+    local_root.mkdir()
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache",
+        catalog=[_api_song(5, artist="Zeta Testers", title="Song Bravo")],
+        download_payload={"ok": True,
+                          "url": "https://www.mediafire.com/file/fakekey01234567/Song.feedpak/file"},
+        local_library_root=local_root,
+        library_importer=lambda path, root: {"libraryImportState": "indexed",
+                                             "libraryFilename": path.relative_to(root).as_posix()},
+    )
+    provider.describe_source()
+
+    result = provider._do_sync(_api_song(5)["id"])
+
+    assert result["ok"] is True
+    # Imported under the deterministic mirror-record name, not the CDN's filename.
+    assert result["localFilename"].endswith("Zeta Testers - Song Bravo.cfake0000000000000000005.feedpak")
+    urls = [u for _m, u in provider.calls]
+    assert any(u.startswith("https://www.mediafire.com/file/") for u in urls)  # the share page
+    assert any(u.startswith("https://download9.mediafire.com/") for u in urls)  # the scraped direct URL
+
+
+def test_do_sync_unsupported_host_fails_loudly_without_fetching(tmp_path):
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache", catalog=[_api_song(5)],
+        download_payload={"ok": True, "url": "https://mega.nz/file/abc123#key"},
+    )
+    provider.describe_source()
+
+    with pytest.raises(RuntimeError, match="mega.nz.*does not support"):
+        provider._do_sync(_api_song(5)["id"])
+
+    assert not any("mega.nz" in u for _m, u in provider.calls)  # refused before any fetch
+
+
+def test_do_sync_direct_package_link_on_unknown_host_still_streams(tmp_path):
+    # A URL whose path plainly names a package is downloadable from any host — the
+    # unsupported-host guard must not regress the catalog's direct-link tail.
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache", catalog=[_api_song(5)],
+        download_payload={"ok": True, "url": "https://files.example.com/paks/Fake%20Song.feedpak"},
+    )
+    provider.describe_source()
+
+    result = provider._do_sync(_api_song(5)["id"])
+
+    assert result["ok"] is True
+    assert result["bytes"] > 0
+
+
+def test_do_sync_html_where_package_expected_fails_loudly(tmp_path):
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache", catalog=[_api_song(5)],
+        download_payload={"ok": True, "url": "https://htmlpage.example.com/Fake.feedpak"},
+    )
+    provider.describe_source()
+
+    with pytest.raises(RuntimeError, match="web page instead of a package"):
+        provider._do_sync(_api_song(5)["id"])
+
+
 def test_do_sync_raises_when_no_download_url(tmp_path):
     provider = FakeFeedForgeAPI(tmp_path / "cache", catalog=[_api_song(5)], download_payload={"ok": False})
     provider.describe_source()
     with pytest.raises(RuntimeError, match="download link"):
         provider._do_sync(_api_song(5)["id"])
+
+
+def test_remote_filename_embeds_the_listing_id(tmp_path):
+    provider = FakeFeedForgeAPI(tmp_path, catalog=[])
+    record = {"id": "cmroqhg7y000004jo7lt0i6cm", "artist": "Fake Artist", "title": "Fake Song"}
+    # The id must survive sanitize_filename verbatim (dots are allowed; brackets are not).
+    assert provider._remote_filename(record) == "Fake Artist - Fake Song.cmroqhg7y000004jo7lt0i6cm.feedpak"
+
+
+def test_multiple_listings_of_same_song_download_separately(tmp_path):
+    """Two FeedForge listings of the same artist+title (different charters/versions) must
+    keep distinct local files: the second listing downloads instead of resolving to the
+    first listing's file, and neither import collides into a `-2` suffixed name."""
+    local_root = tmp_path / "dlc"
+    local_root.mkdir()
+    v1 = _api_song(11, artist="Dup Band", title="Same Song")
+    v2 = _api_song(12, artist="Dup Band", title="Same Song")
+    provider = FakeFeedForgeAPI(
+        tmp_path / "cache", catalog=[v1, v2],
+        download_payload={"ok": True, "url": "https://www.dropbox.com/scl/fi/x/Song.feedpak?dl=0"},
+        local_library_root=local_root,
+        library_importer=lambda path, root: {"libraryImportState": "indexed",
+                                             "libraryFilename": path.relative_to(root).as_posix()},
+    )
+    provider.describe_source()
+    provider._start_background_sync = provider._background_sync  # run inline, deterministically
+
+    assert provider.sync_song(v1["id"])["cacheState"] == "downloading"
+    ready_v1 = provider.sync_song(v1["id"])
+    assert ready_v1["localFilename"].endswith(_mirror_filename(11, "Dup Band", "Same Song"))
+
+    # The second listing must NOT resolve to the first listing's file.
+    assert provider.sync_song(v2["id"])["cacheState"] == "downloading"
+    ready_v2 = provider.sync_song(v2["id"])
+    assert ready_v2["localFilename"].endswith(_mirror_filename(12, "Dup Band", "Same Song"))
+    assert ready_v1["localFilename"] != ready_v2["localFilename"]
+
+    folder = local_root / provider._source_folder_name()
+    names = sorted(item.name for item in folder.iterdir())
+    assert names == sorted([_mirror_filename(11, "Dup Band", "Same Song"),
+                            _mirror_filename(12, "Dup Band", "Same Song")])
+    assert not any("-2" in name for name in names)  # no collision suffixes were allocated
+
+
+def test_query_page_marks_only_the_downloaded_listing_local(tmp_path):
+    local_root = tmp_path / "dlc"
+    v1 = _api_song(11, artist="Dup Band", title="Same Song")
+    v2 = _api_song(12, artist="Dup Band", title="Same Song")
+    provider = FakeFeedForgeAPI(tmp_path / "cache", catalog=[v1, v2], local_library_root=local_root)
+    name_v1 = _mirror_filename(11, "Dup Band", "Same Song")
+    target = local_root / provider._source_folder_name() / name_v1
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(b"downloaded")
+
+    songs, _total = provider.query_page(size=5)
+    by_id = {song["song_id"]: song for song in songs}
+
+    assert by_id[v1["id"]]["localFilename"].endswith(name_v1)
+    assert by_id[v2["id"]]["localFilename"] == ""  # the sibling listing stays remote
 
 
 def test_sync_song_is_non_blocking_then_plays(tmp_path):
@@ -795,7 +934,7 @@ def test_sync_song_is_non_blocking_then_plays(tmp_path):
 
     second = provider.sync_song(_api_song(5)["id"])
     assert second["playbackSource"] == "library-folder"
-    assert second["localFilename"].endswith("Zeta Testers - Song Bravo.feedpak")
+    assert second["localFilename"].endswith("Zeta Testers - Song Bravo.cfake0000000000000000005.feedpak")
 
 
 def test_active_downloads_reports_downloading_then_ready(tmp_path):
@@ -820,7 +959,7 @@ def test_active_downloads_reports_downloading_then_ready(tmp_path):
     provider._background_sync(_api_song(5)["id"])
     ready = provider.active_downloads()
     assert ready[0]["status"] == "ready"
-    assert ready[0]["localFilename"].endswith("Zeta Testers - Song Bravo.feedpak")
+    assert ready[0]["localFilename"].endswith("Zeta Testers - Song Bravo.cfake0000000000000000005.feedpak")
 
 
 # ------------------------------------------------------------------------- route wiring

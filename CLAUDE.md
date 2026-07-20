@@ -17,7 +17,8 @@ anonymous end-to-end-encrypted Proton Drive public share of package files.
 | [routes.py](routes.py) | `setup(app, context)`: connection management (add / remove / list sources, health probe), a `PROVIDER_TYPES` registry that dispatches each source on its stored `type` (default = direct server; Google Drive folder URLs auto-detected), and wiring providers into FeedBack's library provider coordinator; resolves the local package cache via the `get_sloppak_cache_dir` context callback |
 | [remote_library_client/provider.py](remote_library_client/provider.py) | `BaseLibraryProvider` (shared transport / cache / library-import machinery + graceful-default `get-art` / `tuning-names`) and `DirectLibraryProvider` — the Remote Library Server implementation (`query-page` / `query-artists` / `query-stats` / `tuning-names` / `get-art` / `sync-song`, package download + NAM-tone asset sync) |
 | [remote_library_client/google_drive.py](remote_library_client/google_drive.py) | `GoogleDrivePublicFolderProvider` — the `google-drive-public.v1` type: enumerate a public Drive folder, parse `Artist - Album - Title.feedpak` filenames for metadata, download packages (redirect + confirm-token flow) into the local cache. Also exposes the Drive download as module functions (`drive_file_id_from_url`, `confirmed_download_url`, `download_drive_file`) reused by the FeedForge type |
-| [remote_library_client/feedforge.py](remote_library_client/feedforge.py) | `FeedForgeProvider` — the `feedforge.v1` type: a FeedForge (feedforge.org) account as a provider via the **documented v1 plugin API** (`FeedForge-Plugin-API-Guide.md`; live-verified 2026-07-16). Auth = a user-created access key (`ffp_…`, Bearer, stored in the source `token` field); `GET /api/v1/me` probes the key + supplies identity (default labels) and expiry (card warning). The catalog is a **persisted local mirror**: one paced cursor walk of `GET /api/v1/songs`, then `updatedAfter` deltas + the `GET /api/v1/deletions` tombstone feed, with ETag/304; browsing/search/sorts/letters/artists/totals are all served locally. Download resolves `POST /api/v1/songs/{id}/download` → `{ok,url}` (an external Google Drive / Dropbox / **Proton Drive** link) and dispatches to the matching host path. Stdlib only; non-blocking background sync like Google/Proton. Discord-account users are covered too — they create a key in their browser |
+| [remote_library_client/feedforge.py](remote_library_client/feedforge.py) | `FeedForgeProvider` — the `feedforge.v1` type: a FeedForge (feedforge.org) account as a provider via the **documented v1 plugin API** (`FeedForge-Plugin-API-Guide.md`; live-verified 2026-07-16). Auth = a user-created access key (`ffp_…`, Bearer, stored in the source `token` field); `GET /api/v1/me` probes the key + supplies identity (default labels) and expiry (card warning). The catalog is a **persisted local mirror**: one paced cursor walk of `GET /api/v1/songs`, then `updatedAfter` deltas + the `GET /api/v1/deletions` tombstone feed, with ETag/304; browsing/search/sorts/letters/artists/totals are all served locally. Download resolves `POST /api/v1/songs/{id}/download` → `{ok,url}` (an external Google Drive / Dropbox / MediaFire / **Proton Drive** link) and dispatches to the matching host path. Stdlib only; non-blocking background sync like Google/Proton. Discord-account users are covered too — they create a key in their browser |
+| [remote_library_client/mediafire.py](remote_library_client/mediafire.py) | Module functions for MediaFire-hosted FeedForge downloads (`is_mediafire_url`, `direct_url_from_page`, `download_mediafire_file`) — the share page's `#downloadButton` scraped for the per-request `download####.mediafire.com` URL, streamed via the provider's guarded opener. Stdlib-only; not a provider type of its own (page shape live-verified 2026-07-19) |
 | [remote_library_client/proton_drive.py](remote_library_client/proton_drive.py) | `ProtonPublicShareProvider` — the `proton-public.v1` type: anonymous SRP auth to a Proton public share, decrypt the OpenPGP key hierarchy + folder listing (`pysequoia`), parse `Artist-Title.feedpak` filenames, download + decrypt content blocks into the local cache. Also exposes `download_share_package` (a module function, the Drive-flavored sibling of `download_drive_file`) so the FeedForge type can fetch a song whose uploader hosts it on Proton — handles both single-file shares (`LinkType == 2`, content key on the bootstrap material; verified live) and folder shares. Needs `bcrypt` + `pysequoia` (see `requirements.txt`) |
 | [remote_library_client/proton_srp.py](remote_library_client/proton_srp.py) | Dependency-light reimplementation of Proton's SRP-6a handshake + bcrypt key-stretch, so the plugin needs only `bcrypt` (not the full `proton-client`, which drags in gpg/openssl/requests). Cross-checked against `proton-client` in tests |
 | [remote_library_client/iroh_transport.py](remote_library_client/iroh_transport.py) | `IrohLibraryProvider` — the `iroh-library.v1` type: the **same Remote Library Server protocol tunnelled over an iroh P2P QUIC stream**, reached by a pasted Library ID (EndpointId). Subclasses `DirectLibraryProvider` and overrides only `_urlopen` (HTTP-over-iroh via a socket adapter + a shared background asyncio runtime); adds a non-blocking background sync. Needs `iroh` (see `requirements.txt`, lazy-imported) |
@@ -249,7 +250,7 @@ anonymous end-to-end-encrypted Proton Drive public share of package files.
   URL)`, version read from `plugin.json`). If Cloudflare ever challenges it again (`Cf-Mitigated`
   on a 403), `_api_error` fails loudly with `CLOUDFLARE_BLOCKED_MESSAGE` — the dev asked to be told
   about firewall regressions; do not add a browser-UA fallback that would mask them.
-- **FeedForge hosts nothing — download is resolve-then-fetch with THREE host paths (all live-verified).**
+- **FeedForge hosts nothing — download is resolve-then-fetch with FOUR host paths (all live-verified).**
   `sync_song` is non-blocking (same ~250ms core cap and background machinery as Google/Proton; the
   screen's click handler + `/downloads` poller treat `feedforge:` ids like `gdrive:`). `_do_sync` POSTs
   the **tracked** v1 download endpoint (keeps the user's history + public counters; the guide asks for
@@ -257,11 +258,30 @@ anonymous end-to-end-encrypted Proton Drive public share of package files.
   `google_drive.download_drive_file` (confirm-token flow); **Proton Drive** (real in the wild!) →
   `proton_drive.download_share_package` — anonymous SRP + block decrypt, single-file (`LinkType == 2`)
   and folder shares both handled, lazily importing the Proton native deps and degrading to a clear
-  "install bcrypt + pysequoia" message without them; **everything else (Dropbox)** →
-  `_download_url_to_cache` after `_direct_download_url` coerces `?dl=0` (HTML preview) to `?dl=1`. It
-  **imports under the deterministic `Artist - Title.feedpak` name** (not the CDN's Content-Disposition)
-  so the browse-time `settingsKey` matches core's key for the imported file (the client↔core
-  playback-settings-key contract). Cover art (`coverUrl`) is public — fetched **without** the key.
+  "install bcrypt + pysequoia" message without them; **MediaFire** (a FeedForge host since 2026-07;
+  page shape verified live 2026-07-19) → `mediafire.download_mediafire_file` — the share link serves
+  an HTML *page*, so its `#downloadButton` href (base64 `data-scrambled-url` as the fallback) is
+  scraped for the per-request `download####.mediafire.com` URL; a scraped target must stay on a
+  mediafire.com host (loud failure over fetching who-knows-what if the page layout changes), and a
+  dead file (redirect to `error.php`, HTTP 404, "Invalid or Deleted File") surfaces the clear
+  `FILE_GONE_MESSAGE` instead of caching an HTML page as a package; **Dropbox + plainly-direct
+  package links** (any host whose URL *path* ends in a package suffix) → `_download_direct_package`,
+  which coerces Dropbox's `?dl=0` (HTML preview) to `?dl=1` via `_direct_download_url` and *refuses*
+  an HTML response; **any other host fails loudly pre-fetch** (`_unsupported_link_error`, a
+  "please report it" message naming the host) — both guards kill the silent HTML-cached-as-feedpak
+  failure class MediaFire used to be, so a future FeedForge host addition surfaces as a clear error,
+  never a corrupt import. It
+  **imports under the deterministic `Artist - Title.<songId>.feedpak` name** (not the CDN's
+  Content-Disposition) so the browse-time `settingsKey` matches core's key for the imported file (the
+  client↔core playback-settings-key contract). The embedded song id keeps the name unique **per
+  listing** — FeedForge carries multiple uploads of some songs (same artist+title, distinct records),
+  and a shared `Artist - Title` name made a second version resolve to the first version's file instead
+  of downloading, or collide concurrent syncs into `-2` imports whose settingsKey no longer matched.
+  The id rides between dots (brackets would be mangled by `sanitize_filename`), and
+  `playback_settings_key` hashes the whole filename so keys stay per-listing. Pre-v0.7.2 downloads
+  (no id in the name) are deliberately unrecognized — an accepted break, do NOT add a legacy-name
+  fallback (an id-less file is unattributable once a second listing exists); they stay playable in
+  the local library. Cover art (`coverUrl`) is public — fetched **without** the key.
 
 ## Rules
 
